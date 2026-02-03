@@ -1,0 +1,80 @@
+[package]
+name = "zktransformer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-runtime" }
+icicle-core = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-core" }
+icicle-bls12-381 = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-bls12-381", features = [
+    "msm",
+    "pairing",
+] }
+icicle-goldilocks = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-goldilocks" }
+icicle-hash = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-hash" }
+icicle-bn254 = { git = "https://github.com/ingonyama-zk/icicle", package = "icicle-bn254", features = [
+    "msm",
+    "pairing",
+] }
+plonky2 = { version = "0.2.2", features = ["timing"] }
+log = { version = "0.4.14", default-features = false }
+env_logger = { version = "0.10" }
+tract-onnx = "=0.21.6"
+merlin = { version = "3.0.0" }
+serde = { version = "1.0.201", features = ["derive"] }
+serde_yaml = "0.9"
+bincode = "1.3"
+once_cell = "1.15"
+rand = "0.8.5"
+rayon = "1.10"
+ndarray = { version = "0.15.6", features = ["serde", "rayon"] }
+ndarray_einsum_beta = "0.7.0"
+ark-crypto-primitives = { version = "0.5.0", default-features = false, features = [
+    "sponge",
+] }
+ark-bls12-381 = "0.5.0"
+ark-bn254 = "0.5.0"
+ark-ec = { version = "0.5.0", default-features = false, features = [
+    "parallel",
+] }
+ark-ff = { version = "0.5.0", default-features = false, features = [
+    "parallel",
+] }
+ark-poly = "0.5.0"
+ark-std = "0.5.0"
+ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sumcheck_prover"
+harness = false
+
+[[bench]]
+name = "permute_prove"
+harness = false
+
+[[bench]]
+name = "kzh_openings_fast"
+harness = false
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
+
+[features]
+default = ["bn254", "arkworks"]
+bn254 = []
+bls12_381 = []
+goldilocks = []
+icicle = []
+arkworks = []
+
+[patch.crates-io]
+# Patches to match Dory's requirements (arkworks 0.5.0 with 4dim-glv optimizations)
+ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }
+ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }
+ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }
+ark-poly = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }
+ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "markos/4dim-glv" }

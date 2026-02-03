@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+CLAUDE.md
+pcs_features
+*.log
+playground*
+*.srs
+*.onnx
+*.bin
+*.png
+gpt2/

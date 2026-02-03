@@ -1,0 +1,5 @@
+task: sample
+sf:
+  scale_factor_log: 10
+  table_size_log: 20
+  table_commit_log: 4
