@@ -403,10 +403,28 @@ where
   P::ScalarField: CryptoField,
   P::G1: ark_ec::CurveGroup,
 {
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    use ark_serialize::CanonicalSerialize;
+    let mut bytes = Vec::new();
+    self.c.serialize_compressed(&mut bytes).expect("commitment serialization failed");
+    bytes
+  }
 }
 
 #[cfg(all(feature = "icicle", not(feature = "arkworks")))]
-impl<P: PairingTrait> Commitment<P::ScalarField> for KZH3Commitment<P> where P::ScalarField: CryptoField {}
+impl<P: PairingTrait> Commitment<P::ScalarField> for KZH3Commitment<P>
+where
+  P::ScalarField: CryptoField,
+{
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    // Serialize the commitment point for transcript binding
+    let c_bytes: Vec<u8> = unsafe {
+      let ptr = &self.c as *const _ as *const u8;
+      std::slice::from_raw_parts(ptr, std::mem::size_of_val(&self.c)).to_vec()
+    };
+    c_bytes
+  }
+}
 
 fn get_degree_from_maximum_supported_degree(n: usize) -> (usize, usize, usize) {
   // Balanced split to match reference implementation
@@ -1026,6 +1044,15 @@ where
     kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof)
   }
 
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let srs = &commitment.srs;
+    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+    let r_z = &split_input[0];
+    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
+    let ok = kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
+  }
+
   fn batch_open(
     _commitments: &[Self::Commitment],
     _polys: &[DenseMLPoly<P::ScalarField>],
@@ -1083,6 +1110,15 @@ where
     let r_z = &split_input[0];
     let claimed_eval = proof.f_star.evaluate_at_point(r_z);
     kzh3_verify::<P>(srs, point, &claimed_eval, &commitment.c, proof)
+  }
+
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let srs = &commitment.srs;
+    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+    let r_z = &split_input[0];
+    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
+    let ok = kzh3_verify::<P>(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
   }
 
   fn batch_open(

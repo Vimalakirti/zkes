@@ -404,6 +404,12 @@ pub trait Commitment<F: CryptoField>:
   fn zero() -> Self {
     Self::default()
   }
+
+  /// Serialize commitment for Fiat-Shamir transcript binding.
+  /// Default returns empty bytes (no-op); override for real PCS.
+  fn to_transcript_bytes(&self) -> Vec<u8> {
+    vec![]
+  }
 }
 
 pub trait MLPolyCommit<F: CryptoField, P: MLPoly<F>> {
@@ -416,6 +422,11 @@ pub trait MLPolyCommit<F: CryptoField, P: MLPoly<F>> {
   fn commit(poly: &P, key: &Self::CommitmentKey) -> Self::Commitment;
   fn open(commitment: &Self::Commitment, poly: &P, key: &Self::CommitmentKey, point: &[F]) -> Self::Proof;
   fn verify(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[F]) -> bool;
+  /// Verify and extract the opened evaluation value from the proof.
+  /// Returns (pairing_ok, opened_eval). The caller must check opened_eval == claim.eval.
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, key: &Self::VerifierKey, point: &[F]) -> (bool, F) {
+    (Self::verify(commitment, proof, key, point), <F as CryptoField>::zero())
+  }
   fn batch_open(commitments: &[Self::Commitment], polys: &[P], keys: &[Self::CommitmentKey], point: &[F]) -> Self::BatchProof;
   fn batch_verify(commitments: &[Self::Commitment], proofs: &[Self::Proof], keys: &[Self::VerifierKey], point: &[F]) -> bool;
 }
@@ -484,6 +495,11 @@ impl<F: CryptoField + 'static, P: MLPoly<F> + Clone> MLPolyCommit<F, P> for Naiv
 
   fn verify(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[F]) -> bool {
     commitment.0.evaluate_at_point(point) == *proof
+  }
+
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[F]) -> (bool, F) {
+    let eval = commitment.0.evaluate_at_point(point);
+    (eval == *proof, *proof)
   }
 
   fn batch_open(_commitments: &[Self::Commitment], _polys: &[P], _keys: &[Self::CommitmentKey], _point: &[F]) -> Self::BatchProof {

@@ -5,4 +5,4 @@ pub mod srs_storage;
 pub mod sumcheck;
 
 pub use sumcheck::prover::SumcheckProof;
-pub use sumcheck::{GeneralLinearSumcheckProver, LinearSumcheckProver, SumcheckProver, SumcheckVerifier};
+pub use sumcheck::{GeneralLinearSumcheckProver, LinearSumcheckProver, SparseBoolSumcheckProver, SumcheckProver, SumcheckVerifier};

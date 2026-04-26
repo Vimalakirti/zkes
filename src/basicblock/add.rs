@@ -6,6 +6,30 @@ use crate::util::poly::CryptoField;
 use crate::util::shape::{broadcast_shape, matched_axes};
 use crate::util::transcript::Transcript;
 
+/// Build a mapping from output dimension index to bit offset in claim.point.
+/// For c_shape = [1, 4, 4], the offsets are [0, 0, 2] (dim0=0 bits, dim1=2 bits, dim2=2 bits).
+fn dim_bit_offsets(c_shape: &[usize]) -> Vec<usize> {
+  let mut offsets = Vec::with_capacity(c_shape.len());
+  let mut offset = 0;
+  for &dim in c_shape.iter() {
+    offsets.push(offset);
+    offset += log2_ceil(dim) as usize;
+  }
+  offsets
+}
+
+/// Extract the challenge point for an input from the output claim point,
+/// using the matched output dimension indices.
+fn extract_input_point<F: Clone>(claim_point: &[F], matched: &[usize], c_shape: &[usize], offsets: &[usize]) -> Vec<F> {
+  let mut point = Vec::new();
+  for &m in matched {
+    let start = offsets[m];
+    let end = start + log2_ceil(c_shape[m]) as usize;
+    point.extend_from_slice(&claim_point[start..end]);
+  }
+  point
+}
+
 #[derive(Debug, Clone)]
 pub struct Add;
 impl<F: CryptoField> BasicBlock<F> for Add {
@@ -53,23 +77,11 @@ impl<F: CryptoField> BasicBlock<F> for Add {
     let a_matched = matched_axes(a_shape, c_shape).unwrap();
     let b_matched = matched_axes(b_shape, c_shape).unwrap();
 
+    let offsets = dim_bit_offsets(c_shape);
+    let a_point = extract_input_point(&claim.point, &a_matched, c_shape, &offsets);
+    let b_point = extract_input_point(&claim.point, &b_matched, c_shape, &offsets);
+
     let mut claims = Vec::new();
-    let mut a_start = 0;
-    let mut a_point = Vec::new();
-    for a_m in a_matched {
-      let a_end = a_start + log2_ceil(c_shape[a_m]) as usize;
-      let a_point_slice = claim.point[a_start..a_end].to_vec();
-      a_point.extend(a_point_slice);
-      a_start = a_end;
-    }
-    let mut b_start = 0;
-    let mut b_point = Vec::new();
-    for b_m in b_matched {
-      let b_end = b_start + log2_ceil(c_shape[b_m]) as usize;
-      let b_point_slice = claim.point[b_start..b_end].to_vec();
-      b_point.extend(b_point_slice);
-      b_start = b_end;
-    }
     let a_claim = Claim {
       edge_id: edge_ids[0],
       sparse_id: 0,
@@ -97,22 +109,11 @@ impl<F: CryptoField> BasicBlock<F> for Add {
     let c_shape = &witnesses[2].shape;
     let a_matched = matched_axes(a_shape, c_shape).unwrap();
     let b_matched = matched_axes(b_shape, c_shape).unwrap();
-    let mut a_start = 0;
-    let mut a_point = Vec::new();
-    for a_m in a_matched {
-      let a_end = a_start + log2_ceil(c_shape[a_m]) as usize;
-      let a_point_slice = c_point[a_start..a_end].to_vec();
-      a_point.extend(a_point_slice);
-      a_start = a_end;
-    }
-    let mut b_start = 0;
-    let mut b_point = Vec::new();
-    for b_m in b_matched {
-      let b_end = b_start + log2_ceil(c_shape[b_m]) as usize;
-      let b_point_slice = c_point[b_start..b_end].to_vec();
-      b_point.extend(b_point_slice);
-      b_start = b_end;
-    }
+
+    let offsets = dim_bit_offsets(c_shape);
+    let a_point = extract_input_point(c_point, &a_matched, c_shape, &offsets);
+    let b_point = extract_input_point(c_point, &b_matched, c_shape, &offsets);
+
     let a_claim = claims[0];
     let b_claim = claims[1];
     let c_claim = claims[2];
@@ -173,23 +174,11 @@ impl<F: CryptoField> BasicBlock<F> for Sub {
     let a_matched = matched_axes(a_shape, c_shape).unwrap();
     let b_matched = matched_axes(b_shape, c_shape).unwrap();
 
+    let offsets = dim_bit_offsets(c_shape);
+    let a_point = extract_input_point(&claim.point, &a_matched, c_shape, &offsets);
+    let b_point = extract_input_point(&claim.point, &b_matched, c_shape, &offsets);
+
     let mut claims = Vec::new();
-    let mut a_start = 0;
-    let mut a_point = Vec::new();
-    for a_m in a_matched {
-      let a_end = a_start + log2_ceil(c_shape[a_m]) as usize;
-      let a_point_slice = claim.point[a_start..a_end].to_vec();
-      a_point.extend(a_point_slice);
-      a_start = a_end;
-    }
-    let mut b_start = 0;
-    let mut b_point = Vec::new();
-    for b_m in b_matched {
-      let b_end = b_start + log2_ceil(c_shape[b_m]) as usize;
-      let b_point_slice = claim.point[b_start..b_end].to_vec();
-      b_point.extend(b_point_slice);
-      b_start = b_end;
-    }
     let a_claim = Claim {
       edge_id: edge_ids[0],
       sparse_id: 0,
@@ -217,22 +206,11 @@ impl<F: CryptoField> BasicBlock<F> for Sub {
     let c_shape = &witnesses[2].shape;
     let a_matched = matched_axes(a_shape, c_shape).unwrap();
     let b_matched = matched_axes(b_shape, c_shape).unwrap();
-    let mut a_start = 0;
-    let mut a_point = Vec::new();
-    for a_m in a_matched {
-      let a_end = a_start + log2_ceil(c_shape[a_m]) as usize;
-      let a_point_slice = c_point[a_start..a_end].to_vec();
-      a_point.extend(a_point_slice);
-      a_start = a_end;
-    }
-    let mut b_start = 0;
-    let mut b_point = Vec::new();
-    for b_m in b_matched {
-      let b_end = b_start + log2_ceil(c_shape[b_m]) as usize;
-      let b_point_slice = c_point[b_start..b_end].to_vec();
-      b_point.extend(b_point_slice);
-      b_start = b_end;
-    }
+
+    let offsets = dim_bit_offsets(c_shape);
+    let a_point = extract_input_point(c_point, &a_matched, c_shape, &offsets);
+    let b_point = extract_input_point(c_point, &b_matched, c_shape, &offsets);
+
     let a_claim = claims[0];
     let b_claim = claims[1];
     let c_claim = claims[2];

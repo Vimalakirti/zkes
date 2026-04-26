@@ -491,7 +491,13 @@ pub fn evaluate_univariate_polynomial<F: CryptoField + Send + Sync + 'static>(po
   // Total: only 2 field inversions instead of O(n²)
 
   // Step 1: Compute (challenge - i) for all i
+  // If challenge equals an evaluation point, return that value directly
   let diffs: Vec<F> = (0..n).map(|i| challenge - <F as CryptoField>::from_u32(i as u32)).collect();
+  for i in 0..n {
+    if diffs[i] == <F as CryptoField>::zero() {
+      return points[i];
+    }
+  }
 
   // Step 2: Batch inversion for diffs using Montgomery's trick
   let mut prefix_products = vec![<F as CryptoField>::one(); n];
@@ -1029,6 +1035,11 @@ impl<F: CryptoField> SelectionPolynomial<F> {
     let n = self.input_num_vars + self.table_num_vars;
     let mut evaluations = HashMap::new();
     for (input_index, table_index) in self.selection.iter() {
+      debug_assert!(
+        *table_index < (1 << self.table_num_vars),
+        "table_index {} out of range for table_num_vars {}",
+        table_index, self.table_num_vars
+      );
       let index = input_index + table_index * (1 << self.input_num_vars);
       evaluations.insert(index, <F as CryptoField>::one());
     }
@@ -1366,7 +1377,7 @@ pub fn two_pow_dense<F: CryptoField>(num_vars: usize) -> DenseMLPoly<F> {
 
 pub fn fix_variables_zkgpt<F: CryptoField>(
   num_vars: usize,
-  t_idx: &[i128], // n x m, entries in [0, 2^Q]
+  t_idx: &[i128], // n x m, integer witness values
   r: &[F],        // len = log2(n)
   q_bits: usize,
 ) -> DenseMLPoly<F> {
@@ -1428,11 +1439,24 @@ pub fn fix_variables_zkgpt<F: CryptoField>(
         let bl = b >> right_bits;
 
         let t = t_idx[col_base + b];
-        if t > 0 {
-          // ac[bl] += fm[br][t]
-          ac[bl] += F::from(fm[br * fm_width + t as usize]);
+        let abs_t = t.unsigned_abs() as usize;
+        if abs_t == 0 {
+          // skip
+        } else if abs_t <= max_t {
+          // Fast path: table lookup (addition-only precomputed)
+          let val = F::from(fm[br * fm_width + abs_t]);
+          if t > 0 { ac[bl] += val; } else { ac[bl] -= val; }
         } else {
-          ac[bl] -= F::from(fm[br * fm_width + (-t) as usize]);
+          // |t| exceeds table — decompose: t = q * max_t + rem
+          // fm[br][max_t] = max_t * eqy[br], fm[br][rem] = rem * eqy[br]
+          // t * eqy[br] = q * fm[br][max_t] + fm[br][rem]
+          let q = abs_t / max_t;
+          let rem = abs_t % max_t;
+          let mut val = F::from(fm[br * fm_width + max_t]) * F::from(q as u64);
+          if rem > 0 {
+            val += F::from(fm[br * fm_width + rem]);
+          }
+          if t > 0 { ac[bl] += val; } else { ac[bl] -= val; }
         }
       }
 

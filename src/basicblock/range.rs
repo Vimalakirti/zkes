@@ -27,14 +27,31 @@ impl<F: CryptoField> BasicBlock<F> for NonNegative {
 
     let mut selection = Vec::new();
 
-    // currently only support non-negative range
+    let table_size = 1usize << self.table_size_log;
+    let mut oor_count = 0usize;
+    let mut min_val: i128 = 0;
+    let mut max_val: i128 = 0;
+    let mut oor_samples: Vec<(usize, i128)> = Vec::new();
     for i in 0..n {
       let x_i = x.data.as_ref().unwrap().index(i);
       let x_i_num = f_to_int(x_i);
-      // if x_i_num != (x_i_num as usize as i128) {
-      //   println!("x_i_num: {x_i_num}");
-      // }
-      selection.push((i, x_i_num as usize));
+      if x_i_num < min_val { min_val = x_i_num; }
+      if x_i_num > max_val { max_val = x_i_num; }
+      // Clamp out-of-range values to 0 so the prover doesn't overflow.
+      // The selection polynomial will be wrong for these entries, and the
+      // verifier will reject the proof via the eval_to_check != eval_acc check.
+      let table_index = if x_i_num >= 0 && (x_i_num as u128) < table_size as u128 {
+        x_i_num as usize
+      } else {
+        oor_count += 1;
+        if oor_samples.len() < 6 { oor_samples.push((i, x_i_num)); }
+        0
+      };
+      selection.push((i, table_index));
+    }
+    if oor_count > 0 {
+      eprintln!("[NonNeg] tsl={}, shape={:?}, n={}, min={}, max={}, oor={}/{}, samples={:?}",
+        self.table_size_log, x.shape, n, min_val, max_val, oor_count, n, oor_samples);
     }
     let selection_polynomial = SelectionPolynomial::new(num_var, self.table_size_log, selection);
     let aux_data: SparseMLPoly<F> = selection_polynomial.to_sparse();
@@ -46,6 +63,7 @@ impl<F: CryptoField> BasicBlock<F> for NonNegative {
       data_type: x.data_type,
       sf: 0,
       role: Role::Auxiliary,
+      is_permuted_with: None,
     };
     vec![aux]
   }

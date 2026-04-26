@@ -16,8 +16,8 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use zktransformer::util::transcript::Transcript;
-use zktransformer::{
+use zk_torch_2::util::transcript::Transcript;
+use zk_torch_2::{
   crypto::polycommit::kzh3::{setup_kzh3_srs, KZH3Commit, KZH3CommitKey, KZH3Commitment, KZH3VerifierKey},
   crypto::polycommit::sparse_kzh3::{SparseKZH3Commit, SparseKZH3CommitKey, SparseKZH3VerifierKey},
   crypto::polycommit::{MLPolyCommit, NaiveMLPolyCommit},
@@ -28,9 +28,9 @@ use zktransformer::{
 };
 
 #[cfg(all(feature = "arkworks", feature = "bn254"))]
-use zktransformer::crypto::polycommit::ArkBn254 as PairingType;
+use zk_torch_2::crypto::polycommit::ArkBn254 as PairingType;
 #[cfg(all(feature = "icicle", feature = "bn254"))]
-use zktransformer::crypto::polycommit::IcicleBn254 as PairingType;
+use zk_torch_2::crypto::polycommit::IcicleBn254 as PairingType;
 
 fn generate_random_field_vec(size: usize) -> Vec<F> {
   let mut rng = rand::thread_rng();

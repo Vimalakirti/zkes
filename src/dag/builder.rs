@@ -1,6 +1,7 @@
 use crate::basicblock::add::{Add, Sub};
+use crate::basicblock::clamp::{ClampLower, ZeroCheck};
 use crate::basicblock::einsum::Einsum;
-use crate::basicblock::exp::{ExpHelper, TwoPow};
+use crate::basicblock::exp::{ExpHelper, NonStructuredExp, TwoPow};
 use crate::basicblock::llama::SigmoidConst;
 use crate::basicblock::range::NonNegative;
 use crate::basicblock::scale::{ScaleDown, ScaleUp};
@@ -30,8 +31,9 @@ pub struct DagBuilder<F: CryptoField + 'static> {
   pub num_edges: usize, // monotonically increasing physical edge IDs
   pub init_values: Vec<Option<Witness<F>>>,
   // Lookups
-  pub range: Vec<NodeId>,   // currently only support non-negative range
-  pub two_pow: Vec<NodeId>, // nodes that compute 2^(-k)
+  pub range: Vec<NodeId>,      // currently only support non-negative range
+  pub two_pow: Vec<NodeId>,    // nodes that compute 2^(-k)
+  pub zero_check: Vec<NodeId>, // nodes that assert their input MLE is identically zero
 }
 
 impl<F: CryptoField + 'static> DagBuilder<F> {
@@ -42,6 +44,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
       init_values: Vec::new(),
       range: Vec::new(),
       two_pow: Vec::new(),
+      zero_check: Vec::new(),
     }
   }
 
@@ -90,6 +93,68 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let _ = self.add_gkr_node(vec![a], nonneg_basicblock);
     self.init_values.push(Some(Witness::new_wo_data(vec![1], DataType::Float, 0, Role::Auxiliary)));
     self.range.push(nid);
+  }
+
+  /// Wire a ZeroCheck node: asserts MLE of edge `a` is identically zero.
+  /// The input edge is exposed as a sink; `Dag::prove`/`verify` draw a fresh
+  /// challenge for it via the `output_ports` mechanism and the verifier
+  /// rejects unless the claim's eval equals zero.
+  pub fn add_zero_check_node(&mut self, a: EdgeId) {
+    let nid = self.nodes.len();
+    let zc_basicblock = BasicBlockType::ZeroCheck(ZeroCheck);
+    let _ = self.add_gkr_node(vec![a], zc_basicblock);
+    self.zero_check.push(nid);
+  }
+
+  /// One-sided clamp: y = max(x, -C), enforced by the gadget
+  ///   NonNeg(y - x)  ∧  NonNeg(y + C)  ∧  ZeroCheck((y - x)(y + C))
+  /// Used to cap exp inputs within [-C, ∞) so ExpHelper's K_BITS range is
+  /// always sufficient (masked scores of roughly -100·SF get clamped to -C).
+  pub fn clamp_lower(&mut self, x: EdgeId) -> EdgeId {
+    let x_w = self.init_values[x].as_ref().unwrap();
+    let shape = x_w.shape.clone();
+    let sf = x_w.sf;
+    let data_type = x_w.data_type;
+    let n_flat: usize = shape.iter().map(|s| next_pow(*s as u32) as usize).product();
+    let flat_shape = vec![n_flat];
+
+    // Zero out padding of x so delta/u are exactly 0 in padding (upstream ops
+    // can leave garbage there, which would fail the NonNeg range checks).
+    let x = self.mask(x, shape.clone());
+
+    // Pick C = 14 * round(ln2 * SF): one k-step below the K_BITS=4 boundary
+    // (max k = 15), so after clamping every exp input is safely within range.
+    let sf_val: f64 = (1u64 << sf) as f64;
+    let ln2_sf = (2.0_f64.ln() * sf_val).round() as u64;
+    let c_val: u64 = 14 * ln2_sf;
+
+    // y = ClampLower(x)
+    let clamp_bb = BasicBlockType::ClampLower(ClampLower { c: c_val });
+    let y = self.add_gkr_node(vec![x], clamp_bb)[0];
+    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, sf, Role::Output)));
+
+    // delta = y - x, range-check delta ≥ 0
+    let delta = self.sub(y, x)[0];
+    let delta_flat = self.change_shape(delta, flat_shape.clone());
+    self.add_nonneg_node(delta_flat);
+
+    // u = y + C, range-check u ≥ 0
+    let n_real: usize = shape.iter().product();
+    let c_vals: Vec<F> = (0..n_real).map(|_| F::from(c_val as u32)).collect();
+    let c_arr = ArrayD::from_shape_vec(shape.clone(), c_vals).unwrap();
+    let c_pad = pad_to_pow_of_two(&c_arr, &<F as CryptoField>::zero());
+    let c_col_major: Vec<_> = c_pad.clone().view().reversed_axes().iter().cloned().collect();
+    let c_witness = Witness::new(shape.clone(), c_col_major, data_type, sf, Role::Constant);
+    let c_edge = self.param(c_witness);
+    let u = self.add(y, c_edge)[0];
+    let u_flat = self.change_shape(u, flat_shape.clone());
+    self.add_nonneg_node(u_flat);
+
+    // z = delta * u (elementwise), then ZeroCheck(z)
+    let z = self.einsum("a,a->a".to_string(), vec![delta_flat, u_flat], false)[0];
+    self.add_zero_check_node(z);
+
+    y
   }
 
   pub fn change_shape(&mut self, a: EdgeId, shape: Vec<usize>) -> EdgeId {
@@ -254,7 +319,20 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     self.add_gkr_node(vec![a], scale_basicblock)
   }
 
+  pub fn nonstructured_exp(&mut self, a: EdgeId, t: EdgeId) -> Vec<EdgeId> {
+    let shape = self.init_values[a].as_ref().unwrap().shape.clone();
+    let data_type = self.init_values[a].as_ref().unwrap().data_type;
+
+    let exp_basicblock = BasicBlockType::NonStructuredExp(NonStructuredExp);
+    self.init_values.push(Some(Witness::new_wo_data(shape.clone(), data_type, *SF_LOG, Role::Output)));
+    self.init_values.push(Some(Witness::new_wo_data(vec![1], data_type, 0, Role::Auxiliary)));
+    self.add_gkr_node(vec![a, t], exp_basicblock)
+  }
+
   pub fn exp(&mut self, a: EdgeId) -> Vec<EdgeId> {
+    // Clamp input so ExpHelper's K_BITS=4 decomposition is always valid
+    // (masked-attention scores ≈ -100·SF would otherwise overflow k).
+    let a = self.clamp_lower(a);
     let nid = self.nodes.len();
     let shape = self.init_values[a].as_ref().unwrap().shape.clone();
     let flat_shape = vec![shape.iter().map(|s| next_pow(*s as u32) as usize).product()];
@@ -297,8 +375,8 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let half = Witness::new(flat_shape.clone(), col_major_half, DataType::Float, 15, Role::Constant);
     let half = self.param(half);
 
-    // B3. compute 1
-    let vals_one = (0..*val_num).map(|_| F::from(1)).collect();
+    // B3. compute 1 (at sf=15, 1.0 is represented as 2^15 = 32768)
+    let vals_one = (0..*val_num).map(|_| F::from(1u32 << 15)).collect();
     let vals_one = ArrayD::from_shape_vec(shape.clone(), vals_one).unwrap();
     let pad_vals_one = pad_to_pow_of_two(&vals_one, &<F as CryptoField>::zero());
     let col_major_one: Vec<_> = pad_vals_one.clone().view().reversed_axes().iter().cloned().collect();
@@ -331,6 +409,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
       init_values,
       range,
       two_pow,
+      zero_check,
     } = self;
 
     // edge -> consumers
@@ -354,6 +433,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let input_ports: Vec<EdgeId> = (0..num_edges).filter(|&e| !produced[e] && init_values[e].as_ref().unwrap().role == Role::Input).collect();
     let mut output_ports: Vec<EdgeId> = (0..num_edges).filter(|&e| consumers[e].is_empty()).collect();
     output_ports.extend(range.iter().filter(|&n| matches!(nodes[*n].kind, BasicBlockType::NonNegative(_))).map(|n| nodes[*n].inputs[0]));
+    output_ports.extend(zero_check.iter().map(|n| nodes[*n].inputs[0]));
 
     // in-degree = #inputs that come from produced edges (ignore graph inputs/params)
     let mut indeg = vec![0usize; nodes.len()];
@@ -407,6 +487,7 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
       topo,
       range,
       two_pow,
+      zero_check,
       consumers,
       producers,
       input_ports,

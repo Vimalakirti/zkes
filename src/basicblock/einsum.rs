@@ -9,7 +9,68 @@ use crate::util::transcript::Transcript;
 use crate::SF_LOG;
 use ndarray::ArrayD;
 use ndarray_einsum_beta::*;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Accumulated nanoseconds spent inside `permute_evals_by_ranges` during
+/// `Einsum::prove`. Summed across all einsum nodes in a run.
+pub static EINSUM_PERMUTE_NS: AtomicU64 = AtomicU64::new(0);
+/// Accumulated nanoseconds spent inside the `Einsum::prove` body (total einsum
+/// proving time). Includes the permute time, variable fixing, eq-poly build,
+/// and the linear sumcheck prover.
+pub static EINSUM_PROVE_NS: AtomicU64 = AtomicU64::new(0);
+/// Number of einsum nodes proved.
+pub static EINSUM_PROVE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Accumulated number of permute "elements moved" (2^n per permute call), useful
+/// for understanding throughput independent of wall clock.
+pub static EINSUM_PERMUTE_ELEMS: AtomicU64 = AtomicU64::new(0);
+pub static EINSUM_FIX_VARS_NS: AtomicU64 = AtomicU64::new(0);
+pub static EINSUM_SUMCHECK_NS: AtomicU64 = AtomicU64::new(0);
+pub static EINSUM_EVAL_NS: AtomicU64 = AtomicU64::new(0);
+pub static EINSUM_HELPER_NS: AtomicU64 = AtomicU64::new(0);
+pub static EINSUM_EQPOLY_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_einsum_timers() {
+  EINSUM_PERMUTE_NS.store(0, Ordering::Relaxed);
+  EINSUM_PROVE_NS.store(0, Ordering::Relaxed);
+  EINSUM_PROVE_CALLS.store(0, Ordering::Relaxed);
+  EINSUM_PERMUTE_ELEMS.store(0, Ordering::Relaxed);
+  EINSUM_FIX_VARS_NS.store(0, Ordering::Relaxed);
+  EINSUM_SUMCHECK_NS.store(0, Ordering::Relaxed);
+  EINSUM_EVAL_NS.store(0, Ordering::Relaxed);
+  EINSUM_HELPER_NS.store(0, Ordering::Relaxed);
+  EINSUM_EQPOLY_NS.store(0, Ordering::Relaxed);
+}
+
+pub fn report_einsum_timers() {
+  let permute_ns = EINSUM_PERMUTE_NS.load(Ordering::Relaxed);
+  let prove_ns = EINSUM_PROVE_NS.load(Ordering::Relaxed);
+  let calls = EINSUM_PROVE_CALLS.load(Ordering::Relaxed);
+  let elems = EINSUM_PERMUTE_ELEMS.load(Ordering::Relaxed);
+  let fix_ns = EINSUM_FIX_VARS_NS.load(Ordering::Relaxed);
+  let sumcheck_ns = EINSUM_SUMCHECK_NS.load(Ordering::Relaxed);
+  let eval_ns = EINSUM_EVAL_NS.load(Ordering::Relaxed);
+  let helper_ns = EINSUM_HELPER_NS.load(Ordering::Relaxed);
+  let eqpoly_ns = EINSUM_EQPOLY_NS.load(Ordering::Relaxed);
+  let prove_s = prove_ns as f64 / 1e9;
+  let pct = |ns: u64| if prove_ns > 0 { 100.0 * ns as f64 / prove_ns as f64 } else { 0.0 };
+  println!("=== Einsum prove breakdown ===");
+  println!("  nodes proved:               {}", calls);
+  println!("  total einsum prove:         {:.4}s", prove_s);
+  println!("  ├─ einsum_helper:           {:.4}s ({:.1}%)", helper_ns as f64 / 1e9, pct(helper_ns));
+  println!("  ├─ permute_evals:           {:.4}s ({:.1}%)", permute_ns as f64 / 1e9, pct(permute_ns));
+  println!("  ├─ fix_variables:           {:.4}s ({:.1}%)", fix_ns as f64 / 1e9, pct(fix_ns));
+  println!("  ├─ eq_poly build:           {:.4}s ({:.1}%)", eqpoly_ns as f64 / 1e9, pct(eqpoly_ns));
+  println!("  ├─ sumcheck prove:          {:.4}s ({:.1}%)", sumcheck_ns as f64 / 1e9, pct(sumcheck_ns));
+  println!("  └─ evaluate_at_point:       {:.4}s ({:.1}%)", eval_ns as f64 / 1e9, pct(eval_ns));
+  let accounted = helper_ns + permute_ns + fix_ns + eqpoly_ns + sumcheck_ns + eval_ns;
+  let unaccounted = if prove_ns > accounted { prove_ns - accounted } else { 0 };
+  println!("  unaccounted:                {:.4}s ({:.1}%)", unaccounted as f64 / 1e9, pct(unaccounted));
+  println!("  permuted elements (sum 2^n): {}", elems);
+  println!("===============================");
+}
 
 pub fn broadcast_evals_by_doubling<F: Clone>(evals: &[F], add_dims: usize) -> Vec<F> {
   let mut out = evals.to_vec();
@@ -221,6 +282,42 @@ pub fn char_to_range(symbol: &[char], shape: &[usize]) -> HashMap<char, (usize, 
   char_to_range
 }
 
+/// Pure-by-shape part of `einsum_helper`: returns the per-input permutation
+/// `permute_vecs` only. Depends solely on (equation, input_shapes) — does not
+/// touch any prover-time challenge — so it can be computed once at DAG-build
+/// time and reused.
+///
+/// `shapes` here is just the *input* shapes (one per input slot); the output
+/// shape is irrelevant for this function.
+pub fn einsum_input_permutes(equation: &str, input_shapes: &[Vec<usize>]) -> Vec<Vec<(usize, usize)>> {
+  let (einsum_classification, input_specs, _out_indices) = classify_einsum_indices_from_shapes(equation);
+  // concat free_once, free_multi, summation
+  let mut all_indices = einsum_classification.free_once.clone();
+  all_indices.extend(einsum_classification.free_multi.clone());
+  all_indices.extend(einsum_classification.summation.clone());
+
+  assert_eq!(
+    input_specs.len(),
+    input_shapes.len(),
+    "einsum_input_permutes: number of input specs must equal number of input shapes"
+  );
+
+  let mut permute_vecs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(input_shapes.len());
+  for i in 0..input_shapes.len() {
+    let shape = &input_shapes[i];
+    let spec = &input_specs[i];
+    let c_to_r = char_to_range(spec, shape);
+    let mut permute_vec = Vec::with_capacity(spec.len());
+    for index in all_indices.iter() {
+      if c_to_r.contains_key(index) {
+        permute_vec.push(*c_to_r.get(index).unwrap());
+      }
+    }
+    permute_vecs.push(permute_vec);
+  }
+  permute_vecs
+}
+
 pub fn einsum_helper<F: CryptoField>(
   equation: &str,
   shapes: &[Vec<usize>],
@@ -352,23 +449,13 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
       input_arrays.iter().map(|a| a as &dyn ndarray_einsum_beta::ArrayLike<i128>).collect();
 
     let output_array = einsum(&self.equation, &input_arrays_refs).unwrap();
-    let col_major_output: Vec<_> = output_array.clone().view().reversed_axes().iter().cloned().collect();
+    let col_major_output: Vec<i128> = output_array.view().reversed_axes().iter().copied().collect();
     let output_shape = einsum_output_shape(
       &self.equation,
       &inputs.iter().map(|input| input.shape.clone()).collect::<Vec<Vec<usize>>>(),
     )
     .unwrap();
-    let output_data = col_major_output
-      .iter()
-      .map(|f| {
-        F::from(*f)
-        //if *f > 0 {
-        //  F::from(*f as u32)
-        //} else {
-        //  <F as CryptoField>::zero() - F::from(-*f as u32)
-        //}
-      })
-      .collect::<Vec<F>>();
+    let output_data: Vec<F> = col_major_output.par_iter().map(|f| F::from(*f)).collect();
     vec![Witness::new(
       output_shape,
       output_data,
@@ -386,24 +473,67 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
     transcript: &mut Transcript<F>,
   ) -> (Vec<SumcheckProof<F>>, Vec<Claim<F>>) {
     assert!(out_claims.len() == 1, "Einsum expects 1 output claim for now");
+    let __einsum_prove_start = Instant::now();
     let challenge_point = out_claims[0].point.clone();
     let shapes = witnesses.iter().map(|i| i.shape.clone()).collect::<Vec<Vec<usize>>>();
+    let __helper_start = Instant::now();
     let (permute_vecs, degree_one_challenges, high_degree_challenge, summation_round) = einsum_helper(&self.equation, &shapes, &challenge_point);
+    EINSUM_HELPER_NS.fetch_add(__helper_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let mut sumcheck_input_polys = Vec::with_capacity(permute_vecs.len());
+    // Track which inputs had their permutation pre-applied (so we skip
+    // `invert_points_by_ranges` on the resulting claim point — the
+    // commitment for that edge is already in permuted space).
+    let mut input_pre_permuted: Vec<bool> = Vec::with_capacity(permute_vecs.len());
     for i in 0..permute_vecs.len() {
       let permute_vec = permute_vecs[i].clone();
       let witness = witnesses[i];
       let n = get_n(&witness.shape);
+      // Skip permutation if already pre-permuted OR if the permute_vec is identity
+      // (ranges are contiguous and ascending, e.g. [(0,7),(7,17)] on n=17).
+      let is_identity_perm = {
+        let mut pos = 0usize;
+        permute_vec.iter().all(|&(s, e)| {
+          let ok = s == pos;
+          pos = e;
+          ok
+        }) && pos == n
+      };
+      let pre_permuted = is_identity_perm || matches!(&witness.is_permuted_with, Some(p) if p == &permute_vec);
+      input_pre_permuted.push(pre_permuted);
 
       let permuted_witness_poly = if n >= 18 && degree_one_challenges[i].len() > 0 {
         let witness_evaluations = witness.data_int.as_ref().unwrap();
-        let permuted_witness_evaluations = permute_evals_by_ranges(witness_evaluations, n, &permute_vec);
-        fix_variables_zkgpt(n, &permuted_witness_evaluations, &degree_one_challenges[i], *SF_LOG as usize + 2)
+        let permuted_owned;
+        let permuted_witness_evaluations: &[i128] = if pre_permuted {
+          witness_evaluations.as_slice()
+        } else {
+          let __permute_start = Instant::now();
+          permuted_owned = permute_evals_by_ranges(witness_evaluations, n, &permute_vec);
+          EINSUM_PERMUTE_NS.fetch_add(__permute_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+          EINSUM_PERMUTE_ELEMS.fetch_add(1u64 << n, Ordering::Relaxed);
+          permuted_owned.as_slice()
+        };
+        let __fix_start = Instant::now();
+        let result = fix_variables_zkgpt(n, permuted_witness_evaluations, &degree_one_challenges[i], *SF_LOG as usize + 2);
+        EINSUM_FIX_VARS_NS.fetch_add(__fix_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
       } else {
         let witness_evaluations =
           &witness.data.as_ref().unwrap().as_any().downcast_ref::<DenseMLPoly<F>>().expect("Expected DenseMLPoly for witness").evaluations;
-        let permuted_witness_evaluations = permute_evals_by_ranges(witness_evaluations, n, &permute_vec);
-        DenseMLPoly::new(n, permuted_witness_evaluations).fix_variables(&degree_one_challenges[i])
+        let permuted_owned;
+        let permuted_witness_evaluations: &Vec<F> = if pre_permuted {
+          witness_evaluations
+        } else {
+          let __permute_start = Instant::now();
+          permuted_owned = permute_evals_by_ranges(witness_evaluations, n, &permute_vec);
+          EINSUM_PERMUTE_NS.fetch_add(__permute_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+          EINSUM_PERMUTE_ELEMS.fetch_add(1u64 << n, Ordering::Relaxed);
+          &permuted_owned
+        };
+        let __fix_start = Instant::now();
+        let result = DenseMLPoly::new(n, permuted_witness_evaluations.clone()).fix_variables(&degree_one_challenges[i]);
+        EINSUM_FIX_VARS_NS.fetch_add(__fix_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
       };
 
       sumcheck_input_polys.push(permuted_witness_poly);
@@ -411,27 +541,42 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
     let num_first_rounds = high_degree_challenge.len();
     let num_second_rounds = summation_round;
 
+    let __eqpoly_start = Instant::now();
     let eq_poly_evals = evaluate_lagrange_basis(&high_degree_challenge);
     let eq_poly_evals = broadcast_evals_by_doubling(&eq_poly_evals, num_second_rounds);
     let eq_poly = DenseMLPoly::new(num_first_rounds + num_second_rounds, eq_poly_evals);
     sumcheck_input_polys.push(eq_poly);
+    EINSUM_EQPOLY_NS.fetch_add(__eqpoly_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+    let __sumcheck_start = Instant::now();
     let mut sumcheck_prover = LinearSumcheckProver::new(num_first_rounds + num_second_rounds, sumcheck_input_polys.len(), transcript);
     let sumcheck_proof = sumcheck_prover.prove(&sumcheck_input_polys, transcript);
+    EINSUM_SUMCHECK_NS.fetch_add(__sumcheck_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-    let challenges = sumcheck_prover.challenges;
     let proofs = vec![sumcheck_proof];
+    let __eval_start = Instant::now();
     let mut claims = Vec::new();
     for i in 0..permute_vecs.len() {
-      let point_i_perm = degree_one_challenges[i].iter().chain(challenges.iter()).cloned().collect::<Vec<F>>();
+      let point_i_perm = degree_one_challenges[i].iter().chain(sumcheck_prover.challenges.iter()).cloned().collect::<Vec<F>>();
+      let claim_point = if input_pre_permuted[i] {
+        point_i_perm
+      } else {
+        invert_points_by_ranges(&point_i_perm, &permute_vecs[i])
+      };
+      // After sumcheck, a_arrays[i][0] already contains the evaluation at the challenge point
+      // (bind_variable_to_challenge reduces the polynomial in-place each round)
       let claim_i = Claim {
         edge_id: edge_ids[i],
         sparse_id: 0,
-        point: invert_points_by_ranges(&point_i_perm, &permute_vecs[i]),
-        eval: sumcheck_input_polys[i].evaluate_at_point(&challenges),
+        point: claim_point,
+        eval: sumcheck_prover.a_arrays[i][0],
       };
       claims.push(claim_i);
     }
+    EINSUM_EVAL_NS.fetch_add(__eval_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    EINSUM_PROVE_NS.fetch_add(__einsum_prove_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    EINSUM_PROVE_CALLS.fetch_add(1, Ordering::Relaxed);
 
     (proofs, claims)
   }
@@ -445,9 +590,25 @@ impl<F: CryptoField> BasicBlock<F> for Einsum {
 
     let mut verifier = SumcheckVerifier::new(num_first_rounds + num_second_rounds, claims.len(), transcript);
     let expected_sum = out_claim.eval;
-    let (verification_result, _challenges) = verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), expected_sum);
-    if verification_result.is_none() {
-      println!("verified einsum failed 1");
+    let (verification_result, challenges) = verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), expected_sum);
+    let running_sum = match verification_result {
+      Some(v) => v,
+      None => {
+        println!("verified einsum failed: sumcheck round check");
+        return false;
+      }
+    };
+
+    // Final eval check: running_sum == eq_eval * Π_{i} claims[i].eval
+    let one = <F as CryptoField>::one();
+    let eq_eval = high_degree_challenge.iter().zip(challenges[..num_first_rounds].iter())
+      .fold(one, |acc, (hd_j, r_j)| {
+        acc * (*r_j * *hd_j + (one - *r_j) * (one - *hd_j))
+      });
+    let product_eval = claims[..claims.len() - 1].iter().fold(one, |acc, c| acc * c.eval);
+    let expected = eq_eval * product_eval;
+    if running_sum != expected {
+      println!("verified einsum failed: final_eval check mismatch eq={}", self.equation);
       return false;
     }
     true

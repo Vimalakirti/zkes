@@ -1,13 +1,13 @@
 use std::env;
 use std::time::Instant;
-use zktransformer::crypto::polycommit::{kzh3::setup_kzh3_srs, PairingTrait};
-use zktransformer::crypto::srs_storage::{load_kzh3_srs, store_kzh3_srs};
+use zk_torch_2::crypto::polycommit::{kzh3::setup_kzh3_srs, PairingTrait};
+use zk_torch_2::crypto::srs_storage::{load_kzh3_srs, store_kzh3_srs};
 
 #[cfg(feature = "icicle")]
 use icicle_core::traits::GenerateRandom;
 
 #[cfg(feature = "icicle")]
-type TestPairing = zktransformer::crypto::polycommit::IcicleBn254;
+type TestPairing = zk_torch_2::crypto::polycommit::IcicleBn254;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   let args: Vec<String> = env::args().collect();
@@ -83,7 +83,7 @@ fn load_and_verify_srs(maximum_degree: usize) -> Result<(), Box<dyn std::error::
   println!("Loading KZH3 SRS for maximum_degree={}", maximum_degree);
 
   let load_start = Instant::now();
-  let srs: zktransformer::crypto::polycommit::kzh3::KZH3SRS<TestPairing> = load_kzh3_srs(maximum_degree)?;
+  let srs: zk_torch_2::crypto::polycommit::kzh3::KZH3SRS<TestPairing> = load_kzh3_srs(maximum_degree)?;
   let load_time = load_start.elapsed();
 
   println!("SRS loaded in {:?}", load_time);
@@ -118,7 +118,7 @@ fn test_full_cycle(maximum_degree: usize) -> Result<(), Box<dyn std::error::Erro
 
   // Load SRS
   println!("\n=== Loading Phase ===");
-  let loaded_srs: zktransformer::crypto::polycommit::kzh3::KZH3SRS<TestPairing> = load_kzh3_srs(maximum_degree)?;
+  let loaded_srs: zk_torch_2::crypto::polycommit::kzh3::KZH3SRS<TestPairing> = load_kzh3_srs(maximum_degree)?;
 
   // Verify they match
   println!("\n=== Verification Phase ===");

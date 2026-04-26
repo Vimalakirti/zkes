@@ -33,22 +33,26 @@ impl<F: CryptoField> BasicBlock<F> for ScaleDown {
     let mut selection = Vec::new();
     for i in 0..n {
       let x_i = x.data.as_ref().unwrap().index(i);
-      let mut x_i_num = f_to_int(x_i) as f64;
-      x_i_num /= rescale_factor as f64;
-
-      y_data[i] = F::from(x_i_num.round() as i64);
-      //if x_i_num < 0.0 {
-      //  <F as CryptoField>::zero() - F::from((-x_i_num).round() as u32)
-      //} else {
-      //  F::from(x_i_num.round() as u32)
-      //};
+      let x_int = f_to_int(x_i);
+      // Use integer floor division: y = floor((x + rescale/2) / rescale).
+      // This guarantees aux = (x + rescale/2) mod rescale ∈ [0, rescale),
+      // avoiding the boundary case where f64::round() half-away-from-zero
+      // produces aux = rescale (out of range).
+      let shifted = x_int + rescale_factor_divided_by_2 as i128;
+      let y_int = shifted >> rescale_sf; // arithmetic right shift = floor div for power-of-2
+      y_data[i] = F::from(y_int as i64);
 
       let aux_data = x_i - (y_data[i] * rescale_factor_f);
       let aux_num = f_to_int(aux_data) + rescale_factor_divided_by_2;
-      // if aux_num != (aux_num as usize as i128) {
-      //   println!("aux_num: {aux_num}");
-      // }
-      selection.push((i, aux_num as usize));
+      // Clamp out-of-range values to 0 so the prover doesn't overflow.
+      // The selection polynomial will be wrong for these entries, and the
+      // verifier will reject the proof via the eval_to_check != eval_acc check.
+      let table_index = if aux_num >= 0 && (aux_num as u128) < rescale_factor as u128 {
+        aux_num as usize
+      } else {
+        0
+      };
+      selection.push((i, table_index));
     }
     let selection_polynomial = SelectionPolynomial::new(num_var, rescale_sf, selection);
     let y = Witness::new(inputs[0].shape.clone(), y_data, x.data_type, self.output_sf, Role::Output);
@@ -60,6 +64,7 @@ impl<F: CryptoField> BasicBlock<F> for ScaleDown {
       data_type: x.data_type,
       sf: 0,
       role: Role::Auxiliary,
+      is_permuted_with: None,
     };
     vec![y, aux]
   }
@@ -128,7 +133,15 @@ impl<F: CryptoField> BasicBlock<F> for ScaleUp {
 
       let aux_data = x_i * rescale_factor_f - y_data[i];
       let aux_num = f_to_int(aux_data) + rescale_factor_divided_by_2;
-      selection.push((i, aux_num as usize));
+      // Clamp out-of-range values to 0 so the prover doesn't overflow.
+      // The selection polynomial will be wrong for these entries, and the
+      // verifier will reject the proof via the eval_to_check != eval_acc check.
+      let table_index = if aux_num >= 0 && (aux_num as u128) < rescale_factor as u128 {
+        aux_num as usize
+      } else {
+        0
+      };
+      selection.push((i, table_index));
     }
     let selection_polynomial = SelectionPolynomial::new(num_var, rescale_sf, selection);
     let y = Witness::new(inputs[0].shape.clone(), y_data, x.data_type, self.output_sf, Role::Output);
@@ -140,6 +153,7 @@ impl<F: CryptoField> BasicBlock<F> for ScaleUp {
       data_type: x.data_type,
       sf: 0,
       role: Role::Auxiliary,
+      is_permuted_with: None,
     };
     vec![y, aux]
   }

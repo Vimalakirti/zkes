@@ -436,3 +436,221 @@ impl<F: CryptoField> GeneralLinearSumcheckProver<F> {
       * self.eq[0]
   }
 }
+
+/// Sparse boolean sumcheck prover for range proofs.
+///
+/// Proves Σ_x eq(r, x) · Σ_j w_j · aux_j(x) · (aux_j(x) - 1) = 0
+/// where each aux_j is a selection polynomial (0/1 entries).
+///
+/// Instead of materialising 2^n dense arrays, this tracks only the O(K)
+/// non-zero positions of each selection polynomial and evaluates the
+/// round polynomials in O(K) per evaluation point per round.
+/// Sparse boolean sumcheck prover for proving selection polynomials are binary.
+///
+/// Uses a dense eq array + sorted sparse entries per term to avoid both:
+/// - Materializing full 2^n dense polynomials (memory)
+/// - HashMap overhead (performance)
+///
+/// Computes: Σ_{x ∈ {0,1}^n} eq(r,x) · Σ_j w_j · s_j(x) · (s_j(x) - 1) = 0
+pub struct SparseBoolSumcheckProver<F: CryptoField> {
+  pub num_var: usize,
+  pub current_round: usize,
+  pub challenges: Vec<F>,
+  /// Per-term: (weight = β², sorted entries as Vec<(position, bound_value)>).
+  terms: Vec<(F, Vec<(usize, F)>)>,
+  /// Dense eq(eq_challenge, ·) array. Size = 2^(num_var - current_round).
+  eq_dense: Vec<F>,
+}
+
+impl<F: CryptoField> SparseBoolSumcheckProver<F> {
+  /// Create a new prover. Writes the same transcript header as
+  /// `GeneralLinearSumcheckProver::new(num_var, 3, transcript)`.
+  pub fn new(num_var: usize, transcript: &mut Transcript<F>) -> Self {
+    transcript.append_u64(b"num_var", num_var as u64);
+    transcript.append_u64(b"num_poly", 3u64);
+    Self {
+      num_var,
+      current_round: 0,
+      challenges: Vec::new(),
+      terms: Vec::new(),
+      eq_dense: Vec::new(),
+    }
+  }
+
+  /// Run the sumcheck protocol and return a proof.
+  ///
+  /// * `weights`  – per-term weight β² (same length as `positions`).
+  /// * `positions` – per-term list of non-zero indices in the full 2^n
+  ///   hypercube (selection polynomial entries; all values are implicitly 1).
+  /// * `eq_challenge` – the random point r used to form eq(r, ·).
+  pub fn prove(
+    &mut self,
+    weights: &[F],
+    positions: &[Vec<usize>],
+    eq_challenge: &[F],
+    transcript: &mut Transcript<F>,
+  ) -> SumcheckProof<F> {
+    assert_eq!(weights.len(), positions.len());
+    assert_eq!(eq_challenge.len(), self.num_var);
+
+    // Initialize terms with sorted entries, each position has value = 1.
+    self.terms = weights
+      .iter()
+      .zip(positions.iter())
+      .map(|(&w, pos)| {
+        let one = <F as CryptoField>::one();
+        let mut entries: Vec<(usize, F)> = pos.iter().map(|&idx| (idx, one)).collect();
+        entries.sort_unstable_by_key(|&(idx, _)| idx);
+        (w, entries)
+      })
+      .collect();
+
+    // Compute dense eq(eq_challenge, ·) over the full 2^n hypercube.
+    self.eq_dense = crate::util::poly::evaluate_lagrange_basis(eq_challenge);
+
+    let mut round_messages = Vec::new();
+
+    for _round in 0..self.num_var {
+      let msg = self.compute_round_message();
+      for &m in &msg {
+        transcript.append_scalar(b"round_message", &m);
+      }
+      let challenge = transcript.challenge_scalar(b"challenge");
+      round_messages.push(msg);
+      self.receive_challenge(challenge);
+    }
+
+    let final_eval = self.final_evaluation();
+    SumcheckProof { final_eval, round_messages }
+  }
+
+  /// Compute round polynomial T(c) for c ∈ {0, 1, 2, 3} in a single pass
+  /// over each term's sparse entries. Uses dense eq array for O(1) lookups.
+  fn compute_round_message(&self) -> Vec<F> {
+    let zero = <F as CryptoField>::zero();
+    let one = <F as CryptoField>::one();
+    let two = <F as CryptoField>::from_u32(2);
+    let three = <F as CryptoField>::from_u32(3);
+
+    // Parallel over terms: each computes its [T(0), T(1), T(2), T(3)] contribution
+    let partial_sums: Vec<[F; 4]> = self.terms.par_iter().map(|(w, entries)| {
+      let mut t = [zero; 4];
+      let mut i = 0;
+      while i < entries.len() {
+        let pos = entries[i].0;
+        let rest = pos >> 1;
+        let bit = pos & 1;
+
+        let mut v0 = zero;
+        let mut v1 = zero;
+
+        if bit == 0 {
+          v0 = entries[i].1;
+          i += 1;
+          // Check if next entry is the paired odd position
+          if i < entries.len() && entries[i].0 == 2 * rest + 1 {
+            v1 = entries[i].1;
+            i += 1;
+          }
+        } else {
+          // Only odd position exists
+          v1 = entries[i].1;
+          i += 1;
+        }
+
+        let eq0 = self.eq_dense[2 * rest];
+        let eq1 = self.eq_dense[2 * rest + 1];
+
+        // c=0: aux=v0, eq=eq0
+        t[0] = t[0] + *w * v0 * (v0 - one) * eq0;
+
+        // c=1: aux=v1, eq=eq1
+        t[1] = t[1] + *w * v1 * (v1 - one) * eq1;
+
+        // c=2: aux = 2*v1 - v0, eq = 2*eq1 - eq0
+        let aux2 = two * v1 - v0;
+        let eq2 = two * eq1 - eq0;
+        t[2] = t[2] + *w * aux2 * (aux2 - one) * eq2;
+
+        // c=3: aux = 3*v1 - 2*v0, eq = 3*eq1 - 2*eq0
+        let aux3 = three * v1 - two * v0;
+        let eq3 = three * eq1 - two * eq0;
+        t[3] = t[3] + *w * aux3 * (aux3 - one) * eq3;
+      }
+      t
+    }).collect();
+
+    // Reduce partial sums across threads
+    let mut result = [zero; 4];
+    for t in &partial_sums {
+      for i in 0..4 {
+        result[i] = result[i] + t[i];
+      }
+    }
+    result.to_vec()
+  }
+
+  /// Bind the current variable to `challenge` and advance the round.
+  fn receive_challenge(&mut self, challenge: F) {
+    self.challenges.push(challenge);
+    let zero = <F as CryptoField>::zero();
+
+    // Fold eq_dense: eq_new[rest] = eq[2r] + challenge * (eq[2r+1] - eq[2r])
+    let half = self.eq_dense.len() / 2;
+    let new_eq: Vec<F> = (0..half)
+      .into_par_iter()
+      .map(|rest| {
+        self.eq_dense[2 * rest] + challenge * (self.eq_dense[2 * rest + 1] - self.eq_dense[2 * rest])
+      })
+      .collect();
+    self.eq_dense = new_eq;
+
+    // Fold each term's sorted entries in parallel
+    self.terms.par_iter_mut().for_each(|(_, entries)| {
+      let mut new_entries = Vec::with_capacity(entries.len());
+      let mut i = 0;
+      while i < entries.len() {
+        let pos = entries[i].0;
+        let rest = pos >> 1;
+        let bit = pos & 1;
+
+        let mut v0 = zero;
+        let mut v1 = zero;
+
+        if bit == 0 {
+          v0 = entries[i].1;
+          i += 1;
+          if i < entries.len() && entries[i].0 == 2 * rest + 1 {
+            v1 = entries[i].1;
+            i += 1;
+          }
+        } else {
+          v1 = entries[i].1;
+          i += 1;
+        }
+
+        let new_val = v0 + challenge * (v1 - v0);
+        if new_val != zero {
+          new_entries.push((rest, new_val));
+        }
+      }
+      *entries = new_entries;
+    });
+
+    self.current_round += 1;
+  }
+
+  /// Final evaluation after all rounds.
+  fn final_evaluation(&self) -> F {
+    assert_eq!(self.current_round, self.num_var);
+    let zero = <F as CryptoField>::zero();
+    let one = <F as CryptoField>::one();
+    let eq_val = if self.eq_dense.is_empty() { zero } else { self.eq_dense[0] };
+    let mut inner = zero;
+    for (w, entries) in &self.terms {
+      let v = if entries.is_empty() || entries[0].0 != 0 { zero } else { entries[0].1 };
+      inner = inner + *w * v * (v - one);
+    }
+    eq_val * inner
+  }
+}

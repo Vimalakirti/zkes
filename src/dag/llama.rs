@@ -1,5 +1,5 @@
 use crate::basicblock::BasicBlockType;
-use crate::basicblock::{DivConst, RMSReciprocal, SoftmaxConst};
+use crate::basicblock::{DivConst, Reciprocal, RMSReciprocal, SoftmaxConst};
 use crate::util::poly::CryptoField;
 use crate::SF_FLOAT;
 use crate::{
@@ -113,13 +113,61 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     self.add_gkr_node(vec![a], div_const_basicblock)
   }
 
-  pub fn softmax_const(&mut self, a: EdgeId) -> Vec<EdgeId> {
-    let softmax_const_basicblock = BasicBlockType::SoftmaxConst(SoftmaxConst);
+  /// r[i] = round(SF^2 / x[i]), same shape as x. In Q15: r/SF ≈ 1/x_real.
+  /// Used for softmax normalization (and any div-by-tensor), paired with `rescale(y * r)`.
+  pub fn reciprocal(&mut self, a: EdgeId) -> Vec<EdgeId> {
     assert!(self.init_values[a].is_some(), "Input must be initialized");
     let inp_value = self.init_values[a].as_ref().unwrap();
     let shape = inp_value.shape.clone();
     let sf = inp_value.sf;
     let data_type = inp_value.data_type;
+    let reciprocal_basicblock = BasicBlockType::Reciprocal(Reciprocal);
+    let out_value = Witness::new_wo_data(shape.clone(), data_type, sf, Role::Auxiliary);
+    self.init_values.push(Some(out_value));
+    let r = self.add_gkr_node(vec![a], reciprocal_basicblock)[0];
+
+    // Reciprocity soundness check: bind r to a via |a*r/SF - SF| <= tolerance.
+    // Without it, Reciprocal::verify is a no-op and a malicious prover could
+    // supply any r. Mirrors the tolerance check in `llama_rms_norm` for
+    // RMSReciprocal. The extra einsum also provides a claim on `a`, which the
+    // upstream op needs to pop off its output-claim list.
+    assert!(shape.len() <= 26, "reciprocal: tensor rank too large for einsum letters");
+    let letters: String = (0..shape.len()).map(|i| (b'a' + i as u8) as char).collect();
+    let eq = format!("{0},{0}->{0}", letters);
+    let sf_const = self.param(Witness::new(
+      vec![1],
+      vec![F::from(*SF_FLOAT as u32)],
+      DataType::Float,
+      sf,
+      Role::Constant,
+    ));
+    // Tolerance matches the RMSReciprocal bound: 512 at SF_LOG=15 ≈ 1.5% of SF.
+    // This accommodates round-off in r = round(SF^2/a) and accumulated scale_back error.
+    let tolerance = self.param(Witness::new(
+      vec![1],
+      vec![F::from(512u32)],
+      DataType::Float,
+      sf,
+      Role::Constant,
+    ));
+    let z = self.einsum(eq, vec![a, r], true)[0]; // a*r rescaled to sf
+    let z_diff = self.sub(z, sf_const)[0];
+    let positive_1 = self.add(z_diff, tolerance)[0];
+    let positive_2 = self.sub(tolerance, z_diff)[0];
+    self.add_nonneg_node(positive_1);
+    self.add_nonneg_node(positive_2);
+
+    vec![r]
+  }
+
+  pub fn softmax_const(&mut self, a: EdgeId) -> Vec<EdgeId> {
+    assert!(self.init_values[a].is_some(), "Input must be initialized");
+    let inp_value = self.init_values[a].as_ref().unwrap();
+    let shape = inp_value.shape.clone();
+    let sf = inp_value.sf;
+    let data_type = inp_value.data_type;
+    let dim = *shape.last().unwrap();
+    let softmax_const_basicblock = BasicBlockType::SoftmaxConst(SoftmaxConst { dim });
     let out_value = Witness::new_wo_data(shape, data_type, sf, Role::Output);
     self.init_values.push(Some(out_value));
     self.add_gkr_node(vec![a], softmax_const_basicblock)
@@ -146,14 +194,135 @@ impl<F: CryptoField + 'static> DagBuilder<F> {
     let out = self.add(sin_branch, cos_branch)[0];
     vec![out]
   }
+
+  /// RoPE using pre-computed cos/sin matrices of shape [seq_len, d].
+  /// Unlike `rope()`, this handles all sequence positions at once.
+  pub fn rope_with_vecs(&mut self, a: EdgeId, cos_param: EdgeId, sin_param: EdgeId) -> Vec<EdgeId> {
+    assert!(self.init_values[a].is_some(), "Input must be initialized");
+    let inp_value = self.init_values[a].as_ref().unwrap();
+    let d = inp_value.shape[inp_value.shape.len() - 1];
+    let perm_matrix = pair_swap_perm_matrix::<F>(d);
+    let perm_matrix = Witness::new(vec![d, d], perm_matrix, DataType::Float, 0, Role::Constant);
+    let perm_matrix = self.param(perm_matrix);
+    let sin_branch = self.einsum("bshd,de->bshe".to_string(), vec![a, perm_matrix], false)[0];
+    let cos_branch = a;
+
+    let sin_branch = self.einsum("bshd,sd->bshd".to_string(), vec![sin_branch, sin_param], true)[0];
+    let cos_branch = self.einsum("bshd,sd->bshd".to_string(), vec![cos_branch, cos_param], true)[0];
+    let out = self.add(sin_branch, cos_branch)[0];
+    vec![out]
+  }
+
+  /// Add a lower-triangular causal attention mask to `scores`.
+  /// Scores shape must end with [..., seq_len, seq_len].
+  /// Future positions (key > query) get a large negative value so
+  /// exp(score) ≈ 0 after softmax.
+  pub fn causal_mask(&mut self, scores: EdgeId, seq_len: usize) -> EdgeId {
+    let scores_shape = self.init_values[scores].as_ref().unwrap().shape.clone();
+    let sf = self.init_values[scores].as_ref().unwrap().sf;
+    let padded: Vec<usize> = scores_shape.iter().map(|&s| s.next_power_of_two()).collect();
+    let total_padded: usize = padded.iter().product();
+
+    // Must dominate the largest plausible raw attention score. GPT-2 block 4
+    // head 11 is an outlier "attention-sink" head with scores reaching ±223
+    // after Q·Kᵀ / √d, so the earlier -100·SF mask left masked entries above
+    // the unmasked row max and leaked future tokens. -1000·SF guarantees
+    // masked positions saturate the downstream ExpHelper clamp to ≈ 0.
+    let big_neg_val = 1000u32 * (1u32 << sf);
+    let big_neg: F = <F as CryptoField>::zero() - <F as CryptoField>::from_u32(big_neg_val);
+
+    // Last two dims are [s, t] (query pos, key pos).
+    // MLE layout: s has stride = product of all padded dims before it,
+    //             t has stride = s_stride * s_pad.
+    let ndim = scores_shape.len();
+    let s_pad = padded[ndim - 2];
+    let t_pad = padded[ndim - 1];
+    let s_stride: usize = padded[..ndim - 2].iter().product();
+    let t_stride = s_stride * s_pad;
+
+    let mut mask_data = vec![<F as CryptoField>::zero(); total_padded];
+    let num_groups: usize = padded[..ndim - 2].iter().product();
+    for grp in 0..num_groups {
+      for t in 0..t_pad {
+        for s in 0..s_pad {
+          let idx = grp + s * s_stride + t * t_stride;
+          if t < seq_len && s < seq_len && t > s {
+            mask_data[idx] = big_neg;
+          }
+        }
+      }
+    }
+
+    let mask = Witness::new(scores_shape, mask_data, DataType::Float, sf, Role::Constant);
+    let mask_id = self.param(mask);
+    self.add(scores, mask_id)[0]
+  }
+}
+
+/// Generate cosine matrix for RoPE: shape [seq_len, d].
+/// Data in MLE order (s has stride 1, d has stride seq_padded).
+pub fn rope_cos_mat<F: CryptoField + 'static>(d: usize, seq_len: usize, base: f64) -> Vec<F> {
+  assert!(d % 2 == 0, "d must be even");
+  let half = d / 2;
+  let seq_padded = seq_len.next_power_of_two().max(1);
+  let total = seq_padded * d; // d is already pow2 for head_dim=128
+  let mut data = vec![<F as CryptoField>::zero(); total];
+
+  for i in 0..half {
+    let theta_i = base.powf(-2.0 * (i as f64) / (d as f64));
+    for m in 0..seq_len {
+      let angle = m as f64 * theta_i;
+      let c = (angle.cos() * *SF_FLOAT as f64).round() as i64;
+      let c_f = if c >= 0 {
+        <F as CryptoField>::from_u32(c as u32)
+      } else {
+        <F as CryptoField>::zero() - <F as CryptoField>::from_u32((-c) as u32)
+      };
+      data[m + (2 * i) * seq_padded] = c_f;
+      data[m + (2 * i + 1) * seq_padded] = c_f;
+    }
+  }
+  data
+}
+
+/// Generate sine matrix for RoPE: shape [seq_len, d].
+/// Data in MLE order (s has stride 1, d has stride seq_padded).
+/// Pattern: sin[2i] = +sin(angle), sin[2i+1] = -sin(angle).
+pub fn rope_sin_mat<F: CryptoField + 'static>(d: usize, seq_len: usize, base: f64) -> Vec<F> {
+  assert!(d % 2 == 0, "d must be even");
+  let half = d / 2;
+  let seq_padded = seq_len.next_power_of_two().max(1);
+  let total = seq_padded * d;
+  let mut data = vec![<F as CryptoField>::zero(); total];
+
+  for i in 0..half {
+    let theta_i = base.powf(-2.0 * (i as f64) / (d as f64));
+    for m in 0..seq_len {
+      let angle = m as f64 * theta_i;
+      let s = angle.sin();
+      let pos_val = (s * *SF_FLOAT as f64).round() as i64;
+      let neg_val = (-s * *SF_FLOAT as f64).round() as i64;
+      let to_f = |v: i64| -> F {
+        if v >= 0 {
+          <F as CryptoField>::from_u32(v as u32)
+        } else {
+          <F as CryptoField>::zero() - <F as CryptoField>::from_u32((-v) as u32)
+        }
+      };
+      data[m + (2 * i) * seq_padded] = to_f(pos_val);
+      data[m + (2 * i + 1) * seq_padded] = to_f(neg_val);
+    }
+  }
+  data
 }
 
 pub fn llama_rms_norm<F: CryptoField + 'static>(w_e: EdgeId) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 1, "This custom RMSNorm layer expects 1 input");
-    let x = x[0]; // (batch_size, seq_len, 4096)
+    let x = x[0]; // (batch_size, seq_len, hidden_dim)
     let x_shape = g.init_values[x].as_ref().unwrap().shape.clone();
-    let n = x_shape[x_shape.len() - 1]; // 4096
+    let seq = x_shape[1]; // seq_len (was hardcoded to 1)
+    let n = x_shape[x_shape.len() - 1]; // hidden_dim
     let r = g.rms_reciprocal(x)[0]; // (batch_size, seq_len, 1)
 
     // Prove r is correctly computed
@@ -164,11 +333,14 @@ pub fn llama_rms_norm<F: CryptoField + 'static>(w_e: EdgeId) -> impl FnOnce(&mut
       *SF_LOG as usize,
       Role::Constant,
     ));
-    let tolerance = g.param(Witness::new(vec![1], vec![F::from(2)], DataType::Float, *SF_LOG as usize, Role::Constant));
-    let x_sq = g.einsum("bsi,bsi->bsi".to_string(), vec![x, x], true)[0]; // (batch_size, seq_len, 4096)
+    // Tolerance for |z - sf| where z = mean_sq * r^2 / sf^2. See comment on `r_sq` below:
+    // a single end-of-chain ScaleDown preserves precision even for small r, so 512 is
+    // ample headroom (bounds the prover's r within ~±25% of the true 1/rms).
+    let tolerance = g.param(Witness::new(vec![1], vec![F::from(512u32)], DataType::Float, *SF_LOG as usize, Role::Constant));
+    let x_sq = g.einsum("bsi,bsi->bsi".to_string(), vec![x, x], true)[0];
     let x_sum = g.einsum("bsi->bs".to_string(), vec![x_sq], false)[0]; // (batch_size, seq_len)
     let x_mean = g.div_const(x_sum, n)[0]; // (batch_size, seq_len)
-    let x_mean = g.change_shape(x_mean, vec![1, 1, 1]); // (batch_size, seq_len, 1)
+    let x_mean = g.change_shape(x_mean, vec![1, seq, 1]); // (batch_size, seq_len, 1)
     let n_param: usize = g.param(Witness::new(vec![1], vec![F::from(n as u32)], DataType::Float, 0, Role::Constant));
     let mean_tolerance = g.param(Witness::new(
       vec![1],
@@ -177,16 +349,23 @@ pub fn llama_rms_norm<F: CryptoField + 'static>(w_e: EdgeId) -> impl FnOnce(&mut
       *SF_LOG as usize,
       Role::Constant,
     ));
-    let x_mean_mul_n = g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0]; // (batch_size, seq_len, 1)
+    let x_mean_mul_n = g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0];
 
-    let x_sum_sub_x_mean_mul_n = g.sub(x_sum, x_mean_mul_n)[0]; // (batch_size, seq_len, 1)
+    // Reshape x_sum from (batch, seq) → (batch, seq, 1) so broadcast matches x_mean_mul_n
+    let x_sum = g.change_shape(x_sum, vec![1, seq, 1]);
+    let x_sum_sub_x_mean_mul_n = g.sub(x_sum, x_mean_mul_n)[0];
     let positive_1 = g.add(x_sum_sub_x_mean_mul_n, mean_tolerance)[0];
     let positive_2 = g.sub(mean_tolerance, x_sum_sub_x_mean_mul_n)[0];
     g.add_nonneg_node(positive_1);
     g.add_nonneg_node(positive_2);
 
-    let r_sq = g.einsum("bsi,bsi->bsi".to_string(), vec![r, r], true)[0]; // (batch_size, seq_len, 1)
-    let z = g.einsum("bsi,bsi->bsi".to_string(), vec![x_mean, r_sq], true)[0]; // (batch_size, seq_len, 1)
+    // Compute r_sq WITHOUT intermediate ScaleDown: rescaling r*r by sf would underflow
+    // to 0 whenever r_sf^2 < sf/2 (i.e., rms > ~sqrt(2*sf) in real units), which is common
+    // in deep residual stacks (LLaMA-2-7B hits this at ~layer 10+). Instead we keep r_sq
+    // at scale sf^2 and let the outer ScaleDown (rescale_sf = 2*SF_LOG) produce z at sf
+    // scale in a single rounding step, preserving all intermediate precision.
+    let r_sq = g.einsum("bsi,bsi->bsi".to_string(), vec![r, r], false)[0];
+    let z = g.einsum("bsi,bsi->bsi".to_string(), vec![x_mean, r_sq], true)[0];
     let z_sf_diff = g.sub(z, sf)[0];
     let positive_3 = g.add(z_sf_diff, tolerance)[0];
     let positive_4 = g.sub(tolerance, z_sf_diff)[0];
@@ -194,9 +373,9 @@ pub fn llama_rms_norm<F: CryptoField + 'static>(w_e: EdgeId) -> impl FnOnce(&mut
     g.add_nonneg_node(positive_4);
 
     // Compute RMSNorm
-    let r = g.change_shape(r, vec![1, 1]); // (batch_size, seq_len)
-    let h = g.einsum("bsi,bs->bsi".to_string(), vec![x, r], true)[0]; // (batch_size, seq_len, 4096)
-    let out = g.einsum("bsi,i->bsi".to_string(), vec![h, w_e], true)[0]; // (batch_size, seq_len, 4096)
+    let r = g.change_shape(r, vec![1, seq]); // (batch_size, seq_len)
+    let h = g.einsum("bsi,bs->bsi".to_string(), vec![x, r], true)[0];
+    let out = g.einsum("bsi,i->bsi".to_string(), vec![h, w_e], true)[0];
     vec![out]
   }
 }
@@ -220,39 +399,33 @@ pub fn llama_attention<F: CryptoField + 'static>(
   w_k_e: EdgeId,
   w_v_e: EdgeId,
   w_o_e: EdgeId,
-  pos: usize,
-  _attention_id: usize,
+  num_heads: usize,
+  head_dim: usize,
+  seq_len: usize,
+  cos_param: EdgeId,
+  sin_param: EdgeId,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
-    assert!(x.len() == 4, "This custom Attention layer expects 4 inputs"); // [x, k_cache, v_cache, attention_mask]
-    assert!(pos == 0, "We only support pos == 0 for now (cache is empty)");
+    assert!(x.len() == 1, "This custom Attention layer expects 1 input");
 
-    // in llama2-7b onnx, batch_size = 1, seq_len = 1, head_num = 32 and head_dim = 128
-    let inp = x[0]; // (batch_size, seq_len, 4096); head_num * head_dim = 4096
-                    // use attention_id to index the cache
-    let _k_cache = x[1]; // (batch_size, attention_num, pos, head_num, head_dim)
-    let _v_cache = x[2]; // (batch_size, attention_num, pos, head_num, head_dim)
-    let _attention_mask = x[3]; // (batch_size, 2048, 2048)
+    let inp = x[0]; // (batch_size, seq_len, hidden_dim)
 
-    let q = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_q_e], true)[0]; // (batch_size, seq_len, 4096)
-    let k = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_k_e], true)[0]; // (batch_size, seq_len, 4096)
-    let v = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_v_e], true)[0]; // (batch_size, seq_len, 4096)
+    let q = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_q_e], true)[0];
+    let k = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_k_e], true)[0];
+    let v = g.einsum("bsi,ij->bsj".to_string(), vec![inp, w_v_e], true)[0];
 
-    let q = g.reshape(q, vec![1, 1, 32, 128])[0];
-    let k = g.reshape(k, vec![1, 1, 32, 128])[0];
-    let v = g.reshape(v, vec![1, 1, 32, 128])[0];
+    let q = g.reshape(q, vec![1, seq_len, num_heads, head_dim])[0];
+    let k = g.reshape(k, vec![1, seq_len, num_heads, head_dim])[0];
+    let v = g.reshape(v, vec![1, seq_len, num_heads, head_dim])[0];
 
-    // apply rope embedding
-    let q = g.rope(q, pos)[0];
-    let k = g.rope(k, pos)[0];
+    let q = g.rope_with_vecs(q, cos_param, sin_param)[0];
+    let k = g.rope_with_vecs(k, cos_param, sin_param)[0];
 
-    // (batch_size, seq_len, head_num, head_dim) -> (batch_size, head_num, seq_len, head_dim)
     let q = g.einsum("bshd->bhsd".to_string(), vec![q], false)[0];
     let k = g.einsum("bshd->bhsd".to_string(), vec![k], false)[0];
     let v = g.einsum("bshd->bhsd".to_string(), vec![v], false)[0];
 
-    // (batch_size, head_num, seq_len, head_dim) * (batch_size, head_num, head_dim, Seq_len) -> (batch_size, head_num, seq_len, Seq_len)
-    let d_sqrt_recip = ((*SF_FLOAT as f64) / (128.0_f64.sqrt())).round() as u32;
+    let d_sqrt_recip = ((*SF_FLOAT as f64) / ((head_dim as f64).sqrt())).round() as u32;
     let d_sqrt_recip = g.param(Witness::new(
       vec![1],
       vec![F::from(d_sqrt_recip)],
@@ -261,20 +434,21 @@ pub fn llama_attention<F: CryptoField + 'static>(
       Role::Constant,
     ));
     let scores = g.einsum("bhsd,bhtd->bhst".to_string(), vec![q, k], true)[0];
-    let scores = g.einsum("bhst,s->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
-    // TODO: we skip the mask for now because we only support pos == 0 for now (cache is empty)
-    let softmax_c = g.softmax_const(scores)[0]; // (batch_size, head_num, seq_len, Seq_len)
-    let scores = g.add(scores, softmax_c)[0]; // (batch_size, head_num, seq_len, Seq_len)
-    let scores = g.exp(scores)[0]; // (batch_size, head_num, seq_len, Seq_len)
+    let scores = g.einsum("bhst,z->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
+    let scores = if seq_len > 1 { g.causal_mask(scores, seq_len) } else { scores };
+    // Log-sum-exp softmax: softmax_c is the per-row -logsumexp advice, so exp(scores + c)
+    // is the Q15 softmax directly. Soundness check (sum ≈ SF) belongs in a later pass.
+    let softmax_c = g.softmax_const(scores)[0];
+    let scores = g.add(scores, softmax_c)[0];
+    let scores = g.exp(scores)[0]; // Q15 softmax
 
-    // TODO: check if scores sum to 1
-
-    // (batch_size, head_num, seq_len, Seq_len) * (batch_size, head_num, Seq_len, head_dim) -> (batch_size, head_num, seq_len, head_dim)
     let out = g.einsum("bhst,bhtd->bhsd".to_string(), vec![scores, v], true)[0];
-    let out = g.change_shape(out, vec![1, 1, 32, 128]);
-    let out = g.reshape(out, vec![1, 1, 4096])[0];
+    // Permute (b,h,s,d) -> (b,s,h,d) so the subsequent reshape flattens h/d in the
+    // correct order. A bare `change_shape` would only relabel, mixing up strides.
+    let out = g.einsum("bhsd->bshd".to_string(), vec![out], false)[0];
+    let out = g.reshape(out, vec![1, seq_len, num_heads * head_dim])[0];
 
-    let out = g.einsum("bsi,ij->bsj".to_string(), vec![out, w_o_e], true)[0]; // (batch_size, seq_len, 4096)
+    let out = g.einsum("bsi,ij->bsj".to_string(), vec![out, w_o_e], true)[0];
     vec![out]
   }
 }
@@ -289,15 +463,15 @@ pub fn llama_block<F: CryptoField + 'static>(
   proj_1_w: Witness<F>,
   proj_2_w: Witness<F>,
   proj_3_w: Witness<F>,
-  k_cache: usize,
-  v_cache: usize,
-  attention_mask: usize,
-  pos: usize,
-  attention_id: usize,
+  num_heads: usize,
+  head_dim: usize,
+  seq_len: usize,
+  cos_param: EdgeId,
+  sin_param: EdgeId,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 1, "This custom Block layer expects 1 input");
-    let x = x[0]; // (batch_size, seq_len, 4096)
+    let x = x[0];
     let attn_norm = g.param(attn_norm_w);
     let attn_q = g.param(attn_q_w);
     let attn_k = g.param(attn_k_w);
@@ -308,14 +482,16 @@ pub fn llama_block<F: CryptoField + 'static>(
     let proj_2 = g.param(proj_2_w);
     let proj_3 = g.param(proj_3_w);
 
-    let attn_norm_out = g.pipe(&vec![x], llama_rms_norm(attn_norm));
-    let attn_inp = vec![attn_norm_out[0], k_cache, v_cache, attention_mask];
-    let attn_out = g.pipe(&attn_inp, llama_attention(attn_q, attn_k, attn_v, attn_o, pos, attention_id));
-    let residual_attn = g.add(attn_out[0], x)[0]; // (batch_size, seq_len, 4096)
+    let attn_norm_out = g.pipe(&[x], llama_rms_norm(attn_norm));
+    let attn_out = g.pipe(
+      &[attn_norm_out[0]],
+      llama_attention(attn_q, attn_k, attn_v, attn_o, num_heads, head_dim, seq_len, cos_param, sin_param),
+    );
+    let residual_attn = g.add(attn_out[0], x)[0];
 
-    let proj_norm_out = g.pipe(&vec![residual_attn], llama_rms_norm(proj_norm));
+    let proj_norm_out = g.pipe(&[residual_attn], llama_rms_norm(proj_norm));
     let proj_out = g.pipe(&proj_norm_out, llama_mlp(proj_1, proj_2, proj_3));
-    let residual_proj = g.add(proj_out[0], residual_attn)[0]; // (batch_size, seq_len, 4096)
+    let residual_proj = g.add(proj_out[0], residual_attn)[0];
 
     vec![residual_proj]
   }
@@ -332,55 +508,63 @@ pub fn llama_2_7b<F: CryptoField + 'static>(
   proj_2_w_vec: Vec<Witness<F>>,    // each element is (4096, 11008), length is 32
   proj_3_w_vec: Vec<Witness<F>>,    // each element is (11008, 4096), length is 32
   layer_norm_w: Witness<F>,         // it is (4096)
-  logits_w: Witness<F>,             // it is (4096, 32000)
-  k_cache: Witness<F>,              // it is (batch_size, attention_num, pos, head_num, head_dim)
-  v_cache: Witness<F>,              // it is (batch_size, attention_num, pos, head_num, head_dim)
-  attention_mask: Witness<F>,       // it is (batch_size, 2048, 2048)
-  pos: usize,                       // it is the position of the current token
+  logits_w: Witness<F>,             // it is (4096, vocab_size)
+  num_heads: usize,
+  head_dim: usize,
+  seq_len: usize,
+  vocab_size: usize,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 1, "This custom LLaMA-2-7B layer expects 1 input");
     let mut x = x[0]; // (batch_size, seq_len, 4096)
-    let k_cache = g.param(k_cache);
-    let v_cache = g.param(v_cache);
-    let attention_mask = g.param(attention_mask);
-    for i in 0..32 {
-      // 32 layers in LLaMA-2-7B
-      let attn_norm_w = attn_norm_w_vec[i].to_owned();
-      let attn_q_w = attn_q_w_vec[i].to_owned();
-      let attn_k_w = attn_k_w_vec[i].to_owned();
-      let attn_v_w = attn_v_w_vec[i].to_owned();
-      let attn_o_w = attn_o_w_vec[i].to_owned();
-      let proj_norm_w = proj_norm_w_vec[i].to_owned();
-      let proj_1_w = proj_1_w_vec[i].to_owned();
-      let proj_2_w = proj_2_w_vec[i].to_owned();
-      let proj_3_w = proj_3_w_vec[i].to_owned();
+
+    // Precompute RoPE cos/sin matrices: shape [seq_len, head_dim]
+    let theta = 10000.0;
+    let cos_data = rope_cos_mat::<F>(head_dim, seq_len, theta);
+    let sin_data = rope_sin_mat::<F>(head_dim, seq_len, theta);
+    let cos_param = g.param(Witness::new(
+      vec![seq_len, head_dim],
+      cos_data,
+      DataType::Float,
+      *SF_LOG as usize,
+      Role::Constant,
+    ));
+    let sin_param = g.param(Witness::new(
+      vec![seq_len, head_dim],
+      sin_data,
+      DataType::Float,
+      *SF_LOG as usize,
+      Role::Constant,
+    ));
+
+    let num_layers = attn_norm_w_vec.len();
+    for i in 0..num_layers {
       let block = g.pipe(
-        &vec![x],
+        &[x],
         llama_block(
-          attn_norm_w,
-          attn_q_w,
-          attn_k_w,
-          attn_v_w,
-          attn_o_w,
-          proj_norm_w,
-          proj_1_w,
-          proj_2_w,
-          proj_3_w,
-          k_cache,
-          v_cache,
-          attention_mask,
-          pos,
-          i,
+          attn_norm_w_vec[i].to_owned(),
+          attn_q_w_vec[i].to_owned(),
+          attn_k_w_vec[i].to_owned(),
+          attn_v_w_vec[i].to_owned(),
+          attn_o_w_vec[i].to_owned(),
+          proj_norm_w_vec[i].to_owned(),
+          proj_1_w_vec[i].to_owned(),
+          proj_2_w_vec[i].to_owned(),
+          proj_3_w_vec[i].to_owned(),
+          num_heads,
+          head_dim,
+          seq_len,
+          cos_param,
+          sin_param,
         ),
       );
-      x = block[0]; // (batch_size, seq_len, 4096)
+      x = block[0];
     }
     let layer_norm_w = g.param(layer_norm_w);
-    let layer_norm_out = g.pipe(&vec![x], llama_rms_norm(layer_norm_w)); // (batch_size, seq_len, 4096)
-    let logits_w = g.param(logits_w); // (4096, 32000)
-    let out = g.einsum("bij,jk->ik".to_string(), vec![layer_norm_out[0], logits_w], true)[0]; // (batch_size, seq_len, 32000)
-    let out = g.change_shape(out, vec![1, 32000]); // (batch_size, 32000)
+    let layer_norm_out = g.pipe(&[x], llama_rms_norm(layer_norm_w));
+    let logits_w = g.param(logits_w);
+    let out = g.einsum("bij,jk->ik".to_string(), vec![layer_norm_out[0], logits_w], true)[0];
+    let out = g.change_shape(out, vec![seq_len, vocab_size]);
     vec![out]
   }
 }

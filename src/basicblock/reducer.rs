@@ -69,18 +69,32 @@ impl<F: CryptoField> BasicBlock<F> for Reducer {
     }
     let mut sumcheck_verifier = SumcheckVerifier::new(get_n(&x.shape), 2, transcript);
     let (verification_result, challenges) = sumcheck_verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), eval);
-    if verification_result.is_none() {
-      println!("verified reducer failed 1");
-      return false;
-    }
+    let running_sum = match verification_result {
+      Some(v) => v,
+      None => {
+        println!("verified reducer failed: sumcheck round check");
+        return false;
+      }
+    };
+
+    // Compute eq_eval = Σ_i alpha_i * eq(challenges, claim_i.point)
+    let one = <F as CryptoField>::one();
     let mut eq_eval = <F as CryptoField>::zero();
     for (i, claim) in claims[..claims.len() - 1].iter().enumerate() {
-      let mut eq = <F as CryptoField>::one();
+      let mut eq = one;
       for j in 0..challenges.len() {
-        eq = eq * (challenges[j] * claim.point[j] + (<F as CryptoField>::one() - challenges[j]) * (<F as CryptoField>::one() - claim.point[j]));
+        eq = eq * (challenges[j] * claim.point[j] + (one - challenges[j]) * (one - claim.point[j]));
       }
       eq_eval = eq_eval + alphas[i] * eq;
     }
-    verification_result.is_some()
+
+    // Final eval check: running_sum == x_eval * eq_eval
+    let x_eval = claims[claims.len() - 1].eval;
+    let expected = x_eval * eq_eval;
+    if running_sum != expected {
+      println!("verified reducer failed: final_eval check mismatch");
+      return false;
+    }
+    true
   }
 }

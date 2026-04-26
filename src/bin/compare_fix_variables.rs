@@ -12,7 +12,7 @@ use icicle_bn254::curve::ScalarField as F;
 use icicle_goldilocks::field::ScalarField as F;
 
 use rand::Rng;
-use zktransformer::util::poly::{fix_variables_zkgpt, DenseMLPoly};
+use zk_torch_2::util::poly::{fix_variables_zkgpt, DenseMLPoly};
 
 fn main() {
   println!("Comparing fix_variables vs fix_variables_zkgpt\n");

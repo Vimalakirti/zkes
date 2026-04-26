@@ -413,6 +413,15 @@ where
     kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof)
   }
 
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let srs = &commitment.srs;
+    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+    let r_z = &split_input[0];
+    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
+    let ok = kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
+  }
+
   fn batch_open(
     _commitments: &[Self::Commitment],
     _polys: &[SparseMLPoly<P::ScalarField>],
@@ -471,6 +480,15 @@ where
     let r_z = &split_input[0];
     let claimed_eval = proof.f_star.evaluate_at_point(r_z);
     kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof)
+  }
+
+  fn verify_and_extract(commitment: &Self::Commitment, proof: &Self::Proof, _key: &Self::VerifierKey, point: &[P::ScalarField]) -> (bool, P::ScalarField) {
+    let srs = &commitment.srs;
+    let split_input = split_input(srs, point, scalar_field_zero::<P::ScalarField>());
+    let r_z = &split_input[0];
+    let claimed_eval = proof.f_star.evaluate_at_point(r_z);
+    let ok = kzh3_verify(srs, point, &claimed_eval, &commitment.c, proof);
+    (ok, claimed_eval)
   }
 
   fn batch_open(

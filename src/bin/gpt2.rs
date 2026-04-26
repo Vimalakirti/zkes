@@ -12,12 +12,13 @@ use icicle_bn254::curve::ScalarField as F;
 use icicle_goldilocks::field::ScalarField as F;
 
 use plonky2::{timed, util::timing::TimingTree};
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use zktransformer::util::transcript::Transcript;
-use zktransformer::{
+use zk_torch_2::util::transcript::Transcript;
+use zk_torch_2::{
   crypto::polycommit::kzh3::{setup_kzh3_srs, KZH3Commit, KZH3CommitKey, KZH3Commitment, KZH3VerifierKey},
   crypto::polycommit::sparse_kzh3::{SparseKZH3Commit, SparseKZH3CommitKey, SparseKZH3VerifierKey},
   crypto::polycommit::{MLPolyCommit, NaiveMLPolyCommit},
@@ -27,20 +28,38 @@ use zktransformer::{
   },
   util::poly::{CryptoField, DenseMLPoly, MLPoly, SparseMLPoly},
   util::serialization::measure_total_proof_size,
-  SF_LOG, TABLE_SIZE_LOG,
+  SF_LOG, SF_INT, TABLE_SIZE_LOG,
 };
 
 #[cfg(all(feature = "arkworks", feature = "bn254"))]
-use zktransformer::crypto::polycommit::ArkBn254 as PairingType;
+use zk_torch_2::crypto::polycommit::ArkBn254 as PairingType;
 #[cfg(all(feature = "icicle", feature = "bn254"))]
-use zktransformer::crypto::polycommit::IcicleBn254 as PairingType;
+use zk_torch_2::crypto::polycommit::IcicleBn254 as PairingType;
 
-fn generate_random_field_vec(size: usize) -> Vec<F> {
-  let mut rng = rand::thread_rng();
-  (0..size).map(|_| <F as CryptoField>::from_u32(rng.gen::<u32>() % 500)).collect()
+/// Signed random field elements in [-half_range, half_range].
+/// Zero-mean values prevent activation blowup through layers.
+fn gen_signed(rng: &mut StdRng, size: usize, half_range: u32) -> Vec<F> {
+  let range = 2 * half_range + 1;
+  (0..size).map(|_| {
+    let v = (rng.gen::<u32>() % range) as i64 - half_range as i64;
+    if v >= 0 {
+      <F as CryptoField>::from_u32(v as u32)
+    } else {
+      <F as CryptoField>::zero() - <F as CryptoField>::from_u32((-v) as u32)
+    }
+  }).collect()
 }
 
-fn generate_gpt2_weights() -> (
+/// Norm γ centered around SF_INT (≈1.0 in real space).
+fn gen_norm_weight(rng: &mut StdRng, size: usize) -> Vec<F> {
+  let sf = *SF_INT;
+  (0..size).map(|_| {
+    let noise = (rng.gen::<u32>() % 65) as i64 - 32;
+    <F as CryptoField>::from_u32((sf as i64 + noise) as u32)
+  }).collect()
+}
+
+fn generate_gpt2_weights(rng: &mut StdRng, seq_len: usize) -> (
   Vec<Witness<F>>, // attn_norm_w_vec
   Vec<Witness<F>>, // attn_q_w_vec
   Vec<Witness<F>>, // attn_k_w_vec
@@ -61,6 +80,7 @@ fn generate_gpt2_weights() -> (
   Witness<F>,      // layer_norm_b
   Witness<F>,      // attention_mask
 ) {
+  let sf = *SF_LOG as usize;
   let mut attn_norm_w_vec = Vec::new();
   let mut attn_q_w_vec = Vec::new();
   let mut attn_k_w_vec = Vec::new();
@@ -78,161 +98,31 @@ fn generate_gpt2_weights() -> (
   let mut proj_1_b_vec = Vec::new();
   let mut proj_2_b_vec = Vec::new();
 
-  // Generate weights for 1 transformer layer (reduced for testing)
+  // Xavier-like: matmul std ≈ SF/sqrt(fan_in). 768 inputs → half_range 64;
+  // 3072 inputs (proj_2) → half_range 32. Norm γ near SF_INT (≈1.0).
   for _i in 0..12 {
-    // Attention norm weights: (768)
-    attn_norm_w_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-
-    // Attention Q, K, V, O weights: (768, 768)
-    attn_q_w_vec.push(Witness::new(
-      vec![768, 768],
-      generate_random_field_vec(1024 * 1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_k_w_vec.push(Witness::new(
-      vec![768, 768],
-      generate_random_field_vec(1024 * 1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_v_w_vec.push(Witness::new(
-      vec![768, 768],
-      generate_random_field_vec(1024 * 1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_o_w_vec.push(Witness::new(
-      vec![768, 768],
-      generate_random_field_vec(1024 * 1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-
-    // Attention bias terms: (768)
-    attn_norm_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_q_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_k_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_v_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    attn_o_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-
-    // Projection norm weights: (768)
-    proj_norm_w_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-
-    // MLP weights
-    // proj_1_w: (768, 3072)
-    proj_1_w_vec.push(Witness::new(
-      vec![768, 3072],
-      generate_random_field_vec(1024 * 4096),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    // proj_2_w: (3072, 768)
-    proj_2_w_vec.push(Witness::new(
-      vec![3072, 768],
-      generate_random_field_vec(4096 * 1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-
-    // Projection bias terms
-    proj_norm_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    proj_1_b_vec.push(Witness::new(
-      vec![3072],
-      generate_random_field_vec(4096),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
-    proj_2_b_vec.push(Witness::new(
-      vec![768],
-      generate_random_field_vec(1024),
-      DataType::Float,
-      *SF_LOG as usize,
-      Role::Constant,
-    ));
+    attn_norm_w_vec.push(Witness::new(vec![768], gen_norm_weight(rng, 1024), DataType::Float, sf, Role::Constant));
+    attn_q_w_vec.push(Witness::new(vec![768, 768], gen_signed(rng, 1024 * 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_k_w_vec.push(Witness::new(vec![768, 768], gen_signed(rng, 1024 * 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_v_w_vec.push(Witness::new(vec![768, 768], gen_signed(rng, 1024 * 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_o_w_vec.push(Witness::new(vec![768, 768], gen_signed(rng, 1024 * 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_norm_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_q_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_k_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_v_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    attn_o_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    proj_norm_w_vec.push(Witness::new(vec![768], gen_norm_weight(rng, 1024), DataType::Float, sf, Role::Constant));
+    proj_1_w_vec.push(Witness::new(vec![768, 3072], gen_signed(rng, 1024 * 4096, 64), DataType::Float, sf, Role::Constant));
+    proj_2_w_vec.push(Witness::new(vec![3072, 768], gen_signed(rng, 4096 * 1024, 32), DataType::Float, sf, Role::Constant));
+    proj_norm_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
+    proj_1_b_vec.push(Witness::new(vec![3072], gen_signed(rng, 4096, 64), DataType::Float, sf, Role::Constant));
+    proj_2_b_vec.push(Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant));
   }
 
-  // Layer norm weight: (768)
-  let layer_norm_w = Witness::new(
-    vec![768],
-    generate_random_field_vec(1024),
-    DataType::Float,
-    *SF_LOG as usize,
-    Role::Constant,
-  );
-
-  // Layer norm bias: (768)
-  let layer_norm_b = Witness::new(
-    vec![768],
-    generate_random_field_vec(1024),
-    DataType::Float,
-    *SF_LOG as usize,
-    Role::Constant,
-  );
-
-  // Attention mask: (batch_size=1, seq_len=1, seq_len=1)
-  let attention_mask = Witness::new(
-    vec![1, 1, 1],
-    generate_random_field_vec(1 * 1 * 1),
-    DataType::Float,
-    *SF_LOG as usize,
-    Role::Constant,
-  );
+  let layer_norm_w = Witness::new(vec![768], gen_norm_weight(rng, 1024), DataType::Float, sf, Role::Constant);
+  let layer_norm_b = Witness::new(vec![768], gen_signed(rng, 1024, 64), DataType::Float, sf, Role::Constant);
+  let seq_padded = seq_len.next_power_of_two();
+  let attention_mask = Witness::new(vec![1, seq_len, seq_len], gen_signed(rng, seq_padded * seq_padded, 500), DataType::Float, sf, Role::Constant);
 
   (
     attn_norm_w_vec,
@@ -271,12 +161,19 @@ fn main() {
   let thread_num = rayon::current_num_threads();
   println!("using {} threads", thread_num);
 
-  println!("Generating GPT-2 Small random weights...");
+  let seq_len: usize = std::env::var("SEQ_LEN")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(1);
+  let seed: u64 = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(42);
+  println!("Generating GPT-2 Small calibrated random weights (seq_len={seq_len}, seed={seed})...");
 
   // --- Circuit compilation ---
   let mut g = DagBuilder::new();
 
-  // Generate random weights for GPT-2 Small
+  // Single seeded RNG drives all calibrated witnesses (weights + input).
+  let mut rng = StdRng::seed_from_u64(seed);
+
   let (
     attn_norm_w_vec,
     attn_q_w_vec,
@@ -297,10 +194,10 @@ fn main() {
     layer_norm_w,
     layer_norm_b,
     attention_mask,
-  ) = generate_gpt2_weights();
+  ) = generate_gpt2_weights(&mut rng, seq_len);
 
-  // Input: (batch_size=1, seq_len=1, 768)
-  let x = g.input(vec![1, 1, 768], DataType::Float);
+  // Input: (batch_size=1, seq_len, 768)
+  let x = g.input(vec![1, seq_len, 768], DataType::Float);
 
   // Run GPT-2 Small model
   let output = g.pipe(
@@ -325,6 +222,7 @@ fn main() {
       layer_norm_w,
       layer_norm_b,
       attention_mask,
+      seq_len,
     ),
   )[0];
 
@@ -338,11 +236,14 @@ fn main() {
   let mut dense_commitments: Vec<Option<KZH3Commitment<PairingType>>> = vec![None; dag.num_edges()];
   let mut sparse_commitments: Vec<Option<Vec<KZH3Commitment<PairingType>>>> = vec![None; dag.num_edges()];
 
-  // Witness generation from input (must do this before collecting polynomial sizes)
-  println!("Generating witness from random input...");
+  // Witness generation from input (must do this before collecting polynomial sizes).
+  // Hidden state magnitude ≈ ±2000 mirrors post-embedding+positional scale used in oneshot_gpt2,
+  // giving RMS/LayerNorm enough dynamic range for the mean/x_sq tolerance checks.
+  println!("Generating witness from calibrated random input...");
+  let seq_padded_bin = seq_len.next_power_of_two();
   let input = Witness::new(
-    vec![1, 1, 768],
-    generate_random_field_vec(1024), // Random input tokens
+    vec![1, seq_len, 768],
+    gen_signed(&mut rng, seq_padded_bin * 1024, 2000),
     DataType::Float,
     *SF_LOG as usize,
     Role::Input,
@@ -350,6 +251,10 @@ fn main() {
 
   dag.run(&mut init, &vec![(x, input)]);
   println!("GPT-2 output shape: {:?}", init[output][0].shape);
+
+  // Pre-permute eligible Constant witnesses (weights consumed only by Einsum).
+  // Must run before commit so commitments are to the permuted polynomial.
+  timed!(timing, "apply_prepermute", dag.apply_prepermute(&mut init));
 
   // Collect polynomial sizes from the DAG after witness generation
   let polynomial_sizes = dag.collect_polynomial_sizes(&init);

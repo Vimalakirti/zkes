@@ -1,5 +1,5 @@
 [package]
-name = "zktransformer"
+name = "zk_torch_2"
 version = "0.1.0"
 edition = "2021"
 
@@ -62,6 +62,10 @@ harness = false
 [[bin]]
 name = "setup"
 path = "src/bin/setup.rs"
+
+[[bin]]
+name = "llama_einsum_bench"
+path = "src/bin/llama_einsum_bench.rs"
 
 [features]
 default = ["bn254", "arkworks"]

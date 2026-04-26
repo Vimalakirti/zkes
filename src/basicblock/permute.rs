@@ -1,9 +1,9 @@
 use crate::basicblock::BasicBlock;
-use crate::crypto::{LinearSumcheckProver, SumcheckProof, SumcheckProver};
+use crate::crypto::{LinearSumcheckProver, SumcheckProof, SumcheckProver, SumcheckVerifier};
 use crate::dag::{Claim, Role, Witness};
-use crate::util::arith::next_pow;
+use crate::util::arith::{get_n, next_pow};
 use crate::util::poly::CryptoField;
-use crate::util::poly::{evaluate_lagrange_basis, DenseMLPoly};
+use crate::util::poly::{evaluate_lagrange_basis, DenseMLPoly, MLPoly};
 use crate::util::transcript::Transcript;
 
 // In LLM models, we haven't used this basicblock yet. We can come back to fix TODOs later.
@@ -81,11 +81,48 @@ impl<F: CryptoField> BasicBlock<F> for Permute {
 
   fn verify(
     &self,
-    _witnesses: &[&Witness<F>],
-    _claims: &[&Claim<F>],
-    _sumcheck_proofs: &[&SumcheckProof<F>],
-    _transcript: &mut Transcript<F>,
+    witnesses: &[&Witness<F>],
+    claims: &[&Claim<F>],
+    sumcheck_proofs: &[&SumcheckProof<F>],
+    transcript: &mut Transcript<F>,
   ) -> bool {
+    let x = witnesses[0];
+    let out_claim = claims[claims.len() - 1]; // output claim
+    let n = get_n(&x.shape);
+
+    let mut verifier = SumcheckVerifier::new(n, 2, transcript);
+    let expected_sum = out_claim.eval;
+    let (verification_result, challenges) = verifier.verify(transcript, sumcheck_proofs[0].round_messages.clone(), expected_sum);
+    let running_sum = match verification_result {
+      Some(v) => v,
+      None => {
+        println!("verified permute failed: sumcheck round check");
+        return false;
+      }
+    };
+
+    // Recompute permute_poly evaluated at challenges
+    let output_shape_pow = shape_pow(&self.output_shape);
+    let input_shape_pow = shape_pow(&x.shape);
+    let out_lagrange_basis = evaluate_lagrange_basis(&out_claim.point);
+    let mut permute_poly = DenseMLPoly::new(
+      n,
+      vec![<F as CryptoField>::zero(); 1 << n],
+    );
+    for (input_indices, output_indices) in self.permutation.iter() {
+      let output_index = shape_indices_to_eval_index(&output_shape_pow, output_indices);
+      let input_index = shape_indices_to_eval_index(&input_shape_pow, input_indices);
+      permute_poly[input_index] = permute_poly[input_index] + out_lagrange_basis[output_index];
+    }
+    let permute_eval = permute_poly.evaluate_at_point(&challenges);
+
+    // Final eval check: running_sum == x_eval * permute_eval
+    let x_eval = claims[0].eval; // input claim
+    let expected = x_eval * permute_eval;
+    if running_sum != expected {
+      println!("verified permute failed: final_eval check mismatch");
+      return false;
+    }
     true
   }
 }

@@ -14,10 +14,11 @@ pub fn gpt2_layer_norm<F: CryptoField + 'static>(w_e: EdgeId, b_e: EdgeId) -> im
     let x = x[0]; // (batch_size, seq_len, 768)
     let x_sum = g.einsum("bsi->bs".to_string(), vec![x], false)[0]; // (batch_size, seq_len)
     let x_shape = g.init_values[x].as_ref().unwrap().shape.clone();
+    let seq = x_shape[1]; // seq_len (dynamic)
     let n = x_shape[x_shape.len() - 1]; // 768
     let x_mean = g.div_const(x_sum, n)[0]; // (batch_size, seq_len)
-    let x_mean = g.change_shape(x_mean, vec![1, 1, 1]); // (batch_size, seq_len, 1)
-                                                        // Check x_mean
+    let x_mean = g.change_shape(x_mean, vec![1, seq, 1]); // (batch_size, seq_len, 1)
+                                                          // Check x_mean
     let n_param: usize = g.param(Witness::new(vec![1], vec![F::from(n as u32)], DataType::Float, 0, Role::Constant));
     let mean_tolerance = g.param(Witness::new(
       vec![1],
@@ -28,14 +29,16 @@ pub fn gpt2_layer_norm<F: CryptoField + 'static>(w_e: EdgeId, b_e: EdgeId) -> im
     ));
     let x_mean_mul_n = g.einsum("bsi,i->bsi".to_string(), vec![x_mean, n_param], false)[0]; // (batch_size, seq_len, 1)
 
-    let x_sum_sub_x_mean_mul_n = g.sub(x_sum, x_mean_mul_n)[0]; // (batch_size, seq_len, 1)
+    // Reshape x_sum from (batch, seq) → (batch, seq, 1) so broadcast matches x_mean_mul_n
+    let x_sum_3d = g.change_shape(x_sum, vec![1, seq, 1]);
+    let x_sum_sub_x_mean_mul_n = g.sub(x_sum_3d, x_mean_mul_n)[0]; // (batch_size, seq_len, 1)
     let positive_1 = g.add(x_sum_sub_x_mean_mul_n, mean_tolerance)[0];
     let positive_2 = g.sub(mean_tolerance, x_sum_sub_x_mean_mul_n)[0];
     g.add_nonneg_node(positive_1);
     g.add_nonneg_node(positive_2);
 
     let x_minus_mean = g.sub(x, x_mean)[0]; // (batch_size, seq_len, 768)
-    let x_minus_mean = g.mask(x_minus_mean, vec![1, 1, 768]); // (batch_size, seq_len, 768)
+    let x_minus_mean = g.mask(x_minus_mean, vec![1, seq, 768]); // (batch_size, seq_len, 768)
 
     let x_rms = g.pipe(&vec![x_minus_mean], llama_rms_norm(w_e))[0]; // (batch_size, seq_len, 1)
 
@@ -87,12 +90,13 @@ pub fn gpt2_attention<F: CryptoField + 'static>(
   b_k_e: EdgeId, // (768)
   b_v_e: EdgeId, // (768)
   b_o_e: EdgeId, // (768)
+  seq_len: usize,
   _attention_id: usize,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 2, "This custom Attention layer expects 2 inputs"); // [x, attention_mask]
 
-    // in gpt-2 onnx, batch_size = 1, seq_len = 1, head_num = 12 and head_dim = 64
+    // in gpt-2 onnx, batch_size = 1, head_num = 12 and head_dim = 64
     let inp = x[0]; // (batch_size, seq_len, 768); head_num * head_dim = 768
     let _attention_mask = x[1]; // (batch_size, seq_len, seq_len)
 
@@ -104,9 +108,9 @@ pub fn gpt2_attention<F: CryptoField + 'static>(
     let k = g.add(k, b_k_e)[0]; // (batch_size, seq_len, 768)
     let v = g.add(v, b_v_e)[0]; // (batch_size, seq_len, 768)
 
-    let q = g.reshape(q, vec![1, 1, 12, 64])[0];
-    let k = g.reshape(k, vec![1, 1, 12, 64])[0];
-    let v = g.reshape(v, vec![1, 1, 12, 64])[0];
+    let q = g.reshape(q, vec![1, seq_len, 12, 64])[0];
+    let k = g.reshape(k, vec![1, seq_len, 12, 64])[0];
+    let v = g.reshape(v, vec![1, seq_len, 12, 64])[0];
 
     // (batch_size, seq_len, head_num, head_dim) -> (batch_size, head_num, seq_len, head_dim)
     let q = g.einsum("bshd->bhsd".to_string(), vec![q], false)[0];
@@ -123,18 +127,22 @@ pub fn gpt2_attention<F: CryptoField + 'static>(
       Role::Constant,
     ));
     let scores = g.einsum("bhsd,bhtd->bhst".to_string(), vec![q, k], true)[0];
-    let scores = g.einsum("bhst,s->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
-    // TODO: we skip the mask for now because we only support pos == 0 for now (cache is empty)
-    let softmax_c = g.softmax_const(scores)[0]; // (batch_size, head_num, seq_len, Seq_len)
-    let scores = g.add(scores, softmax_c)[0]; // (batch_size, head_num, seq_len, Seq_len)
-    let scores = g.exp(scores)[0]; // (batch_size, head_num, seq_len, Seq_len)
+    let scores = g.einsum("bhst,z->bhst".to_string(), vec![scores, d_sqrt_recip], true)[0];
+    // Apply causal mask for seq_len > 1 (GPT-2 is autoregressive)
+    let scores = if seq_len > 1 { g.causal_mask(scores, seq_len) } else { scores };
+    // Log-sum-exp softmax: softmax_c is the per-row -logsumexp advice, so exp(scores + c)
+    // equals the Q15 softmax directly — no 1/Σ rescale needed. Soundness in a full prove
+    // path rests on enforcing Σ exp(scores + c) ≈ SF (softmax sums to 1).
+    let softmax_c = g.softmax_const(scores)[0];
+    let scores = g.add(scores, softmax_c)[0];
+    let scores = g.exp(scores)[0]; // Q15 softmax
 
-    // TODO: check if scores sum to 1
-
-    // (batch_size, head_num, seq_len, Seq_len) * (batch_size, head_num, Seq_len, head_dim) -> (batch_size, head_num, seq_len, head_dim)
     let out = g.einsum("bhst,bhtd->bhsd".to_string(), vec![scores, v], true)[0];
-    let out = g.change_shape(out, vec![1, 1, 12, 64]);
-    let out = g.reshape(out, vec![1, 1, 768])[0];
+    // Permute (b,h,s,d) -> (b,s,h,d) so data layout matches the shape label before
+    // `reshape` flattens the last two dims. Without this, `change_shape` would only
+    // relabel while leaving h/s strides mismatched (h_pad=16 vs seq_pad≥64).
+    let out = g.einsum("bhsd->bshd".to_string(), vec![out], false)[0];
+    let out = g.reshape(out, vec![1, seq_len, 768])[0];
 
     let out = g.einsum("bsi,ij->bsj".to_string(), vec![out, w_o_e], true)[0]; // (batch_size, seq_len, 4096)
     let out = g.add(out, b_o_e)[0]; // (batch_size, seq_len, 768)
@@ -163,6 +171,7 @@ pub fn gpt2_block<F: CryptoField + 'static>(
   proj_2_b: Witness<F>,
   attention_mask: usize,
   attention_id: usize,
+  seq_len: usize,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 1, "This custom Block layer expects 1 input");
@@ -200,6 +209,7 @@ pub fn gpt2_block<F: CryptoField + 'static>(
         attn_k_b,
         attn_v_b,
         attn_o_b,
+        seq_len,
         attention_id,
       ),
     );
@@ -238,6 +248,7 @@ pub fn gpt_2_small<F: CryptoField + 'static>(
   layer_norm_w: Witness<F>,         // it is (768)
   layer_norm_b: Witness<F>,         // it is (768)
   attention_mask: Witness<F>,       // it is (batch_size, seq_len, seq_len)
+  seq_len: usize,
 ) -> impl FnOnce(&mut DagBuilder<F>, &[EdgeId]) -> Vec<EdgeId> {
   move |g, x| {
     assert!(x.len() == 1, "This custom GPT-2 Small layer expects 1 input");
@@ -284,6 +295,7 @@ pub fn gpt_2_small<F: CryptoField + 'static>(
           proj_2_b,
           attention_mask,
           i,
+          seq_len,
         ),
       );
       x = block[0]; // (batch_size, seq_len, 768)

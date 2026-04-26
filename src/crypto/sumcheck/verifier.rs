@@ -4,7 +4,6 @@ use crate::util::transcript::Transcript;
 /// Verifier for sumcheck protocols with Fiat-Shamir
 /// num_var: number of variables
 /// num_poly: number of polynomials
-#[allow(dead_code)] // TODO: remove this after num_poly is used
 pub struct SumcheckVerifier<F: CryptoField> {
   num_var: usize,
   num_poly: usize,
@@ -36,7 +35,15 @@ impl<F: CryptoField + Send + Sync + 'static> SumcheckVerifier<F> {
 
     // Verify each round
     for (round, round_message) in round_messages.iter().enumerate() {
-      if !round_message.is_empty() && round_message[0] + round_message[1] != running_sum {
+      // Degree bound check: round polynomial must have exactly num_poly + 1 evaluations
+      if round_message.len() != self.num_poly + 1 {
+        println!(
+          "Round {} degree mismatch: got {} evals, expected {}",
+          round, round_message.len(), self.num_poly + 1
+        );
+        return (None, vec![]);
+      }
+      if round_message[0] + round_message[1] != running_sum {
         println!(
           "Round {} messages mismatch: {:?} != {:?}",
           round,
@@ -59,8 +66,6 @@ impl<F: CryptoField + Send + Sync + 'static> SumcheckVerifier<F> {
       challenges.push(challenge);
     }
 
-    // In a complete implementation, would verify final evaluation
-    // against the multilinear extension at the challenge point
     (Some(running_sum), challenges)
   }
 }
